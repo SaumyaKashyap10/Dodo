@@ -1,0 +1,3567 @@
+import test, { before, after } from 'node:test';
+import assert from 'node:assert/strict';
+import { Pool } from 'pg';
+import { authenticator } from 'otplib';
+import * as argon2 from 'argon2';
+import { createApp } from '../../apps/api/src/main';
+import { Db } from '../../apps/api/src/db';
+import { tick, checkpoint } from '../../apps/worker/src/main';
+import { notifyStaff } from '../../apps/worker/src/notifications';
+import { digest, encrypt, keyed, token } from '../../packages/core/src/security';
+import { createServer } from 'node:net';
+import { createServer as createHttpServer } from 'node:http';
+import { createHmac, randomUUID } from 'node:crypto';
+let app: any,
+  base: string,
+  db: Db,
+  owner: Pool,
+  cookie = '',
+  csrf = '',
+  contentId = '',
+  version = 0,
+  receipt = '',
+  eventId = '',
+  leadId = '',
+  consentCookie = '',
+  chatCookie = '',
+  primaryTenantId = '',
+  secondaryTenantId = '',
+  secondaryWorkflowId = '';
+const input = {
+  name: 'Synthetic Visitor',
+  email: 'synthetic@example.invalid',
+  phone: '+919999999999',
+  institute: 'Synthetic QA Institute',
+  role: 'Owner',
+  students: 500,
+  city: 'Test City',
+  interest: 'Flex',
+  noticeAccepted: true,
+  marketingOptIn: false,
+  formRevision: 'demo-v1',
+  source: 'form',
+};
+const key = randomUUID();
+async function call(
+  path: string,
+  method = 'GET',
+  body?: unknown,
+  extra: Record<string, string> = {},
+  auth = false,
+) {
+  const r = await fetch(base + path, {
+    method,
+    headers: {
+      Origin: process.env.SITE_URL!,
+      'Content-Type': 'application/json',
+      ...(auth ? { Cookie: cookie, 'X-CSRF-Token': csrf } : {}),
+      ...extra,
+    },
+    ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+  });
+  const text = await r.text();
+  let data: any;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    data = text;
+  }
+  return { r, data };
+}
+before(async () => {
+  assert.ok(
+    ['test', 'demo'].includes(process.env.DEPLOYMENT_MODE || ''),
+    'Integration tests require isolated test/demo mode',
+  );
+  owner = new Pool({ connectionString: process.env.MIGRATION_DATABASE_URL });
+  await owner.query('UPDATE users SET last_totp_step=0 WHERE email=$1', [process.env.OWNER_EMAIL]);
+  app = await createApp();
+  await app.listen(0, '127.0.0.1');
+  base = 'http://127.0.0.1:' + app.getHttpServer().address().port;
+  db = app.get(Db);
+});
+after(async () => {
+  await app?.close();
+  await owner?.end();
+});
+test('database readiness is real', async () =>
+  assert.equal((await call('/health/ready')).r.status, 200));
+test('public config contains no secrets', async () => {
+  const r = await call('/v1/public/site');
+  assert.equal(r.r.status, 200);
+  assert.ok(!JSON.stringify(r.data).includes(process.env.DATA_ENCRYPTION_KEY!));
+});
+test('unauthenticated administration denied', async () =>
+  assert.equal((await call('/v1/admin/content')).r.status, 401));
+test('cross-origin mutation denied', async () =>
+  assert.equal(
+    (
+      await call(
+        '/v1/consent/choices',
+        'POST',
+        { analytics: false, advertising: false, policyVersion: '2026-10-v1' },
+        { Origin: 'https://evil.invalid' },
+      )
+    ).r.status,
+    403,
+  ));
+test('MFA staff login returns secure session contract', async () => {
+  const r = await call('/v1/auth/login', 'POST', {
+    email: process.env.OWNER_EMAIL,
+    password: process.env.OWNER_PASSWORD,
+    otp: authenticator.generate(process.env.OWNER_TOTP_SECRET!),
+  });
+  assert.equal(r.r.status, 201, JSON.stringify(r.data));
+  cookie = r.r.headers.getSetCookie()[0]!.split(';')[0]!;
+  csrf = r.data.csrf;
+  assert.match(r.r.headers.getSetCookie()[0]!, /HttpOnly/);
+  assert.match(r.r.headers.getSetCookie()[0]!, /SameSite=Strict/i);
+  assert.ok(csrf);
+  assert.ok(r.data.tenant?.id);
+  assert.equal(r.data.tenant.role, 'owner');
+  assert.ok(Array.isArray(r.data.workspaces));
+  primaryTenantId = r.data.tenant.id;
+});
+test('workspace membership context is explicit and tenant switching is membership-bound', async () => {
+  const second = (
+    await owner.query(
+      `INSERT INTO tenants(slug,display_name,legal_name,status)
+       VALUES($1,$2,$2,'profile_draft')
+       RETURNING id`,
+      ['qa-' + randomUUID().slice(0, 8), 'Synthetic Second Workspace'],
+    )
+  ).rows[0]!;
+  secondaryTenantId = second.id;
+  await owner.query('INSERT INTO onboarding_cases(tenant_id) VALUES($1)', [second.id]);
+  const user = (
+    await owner.query('SELECT id FROM users WHERE lower(email)=lower($1)', [
+      process.env.OWNER_EMAIL,
+    ])
+  ).rows[0]!;
+  await owner.query(
+    `INSERT INTO memberships(tenant_id,user_id,role_key,status)
+     VALUES($1,$2,'owner','active')`,
+    [second.id, user.id],
+  );
+
+  const switched = await call('/v1/auth/switch-tenant', 'POST', { tenantId: second.id }, {}, true);
+  assert.equal(switched.r.status, 201, JSON.stringify(switched.data));
+  assert.equal(switched.data.tenant.id, second.id);
+
+  const me = await call('/v1/auth/me', 'GET', undefined, {}, true);
+  assert.equal(me.r.status, 200, JSON.stringify(me.data));
+  assert.equal(me.data.tenant.id, second.id);
+  assert.ok(me.data.workspaces.some((workspace: any) => workspace.id === primaryTenantId));
+  assert.ok(me.data.workspaces.some((workspace: any) => workspace.id === second.id));
+
+  // Private custom collections: no public route, additive schemas and encrypted records.
+  const initialCollections = await call('/v1/admin/tenant/collections', 'GET', undefined, {}, true);
+  assert.equal(initialCollections.r.status, 200);
+  assert.deepEqual(initialCollections.data, []);
+  const campusField = {
+    key: 'campus_name',
+    label: 'Campus name',
+    kind: 'short_text',
+    required: true,
+    options: [],
+  };
+  const collectionCreated = await call(
+    '/v1/admin/tenant/collections',
+    'POST',
+    { slug: 'qa_campuses', title: 'Campus checklist', fields: [campusField] },
+    {},
+    true,
+  );
+  assert.equal(collectionCreated.r.status, 201, JSON.stringify(collectionCreated.data));
+  const collectionId = collectionCreated.data.id;
+  assert.equal(collectionCreated.data.version, 1);
+  const duplicateCollection = await call(
+    '/v1/admin/tenant/collections',
+    'POST',
+    { slug: 'qa_campuses', title: 'Campus checklist', fields: [campusField] },
+    {},
+    true,
+  );
+  assert.equal(duplicateCollection.r.status, 409);
+  const badCollectionFields = await call(
+    '/v1/admin/tenant/collections',
+    'POST',
+    { slug: 'qa_invalid', title: 'Invalid fields', fields: [campusField, campusField] },
+    {},
+    true,
+  );
+  assert.equal(badCollectionFields.r.status, 422);
+  const recordsRoute = '/v1/admin/tenant/collections/' + collectionId + '/entries';
+  const recordKey = randomUUID();
+  const recordInput = {
+    version: 1,
+    submissionKey: recordKey,
+    values: { campus_name: 'Synthetic north campus' },
+  };
+  const createdRecord = await call(recordsRoute, 'POST', recordInput, {}, true);
+  assert.equal(createdRecord.r.status, 201, JSON.stringify(createdRecord.data));
+  const replayRecord = await call(recordsRoute, 'POST', recordInput, {}, true);
+  assert.equal(replayRecord.r.status, 201);
+  assert.equal(replayRecord.data.replayed, true);
+  assert.equal(replayRecord.data.id, createdRecord.data.id);
+  const collidingRecord = await call(
+    recordsRoute,
+    'POST',
+    { ...recordInput, values: { campus_name: 'Different record' } },
+    {},
+    true,
+  );
+  assert.equal(collidingRecord.r.status, 409);
+  const invalidRecord = await call(
+    recordsRoute,
+    'POST',
+    { ...recordInput, submissionKey: randomUUID(), values: { unknown: 'other' } },
+    {},
+    true,
+  );
+  assert.equal(invalidRecord.r.status, 422);
+  const savedEncrypted = (
+    await owner.query(
+      'SELECT tenant_id,encrypted_data,schema_version FROM tenant_collection_entries WHERE id=$1',
+      [createdRecord.data.id],
+    )
+  ).rows[0];
+  assert.equal(savedEncrypted.tenant_id, secondaryTenantId);
+  assert.equal(savedEncrypted.schema_version, 1);
+  assert.ok(!savedEncrypted.encrypted_data.includes('Synthetic north campus'));
+  const entriesBefore = await call(recordsRoute, 'GET', undefined, {}, true);
+  assert.equal(entriesBefore.r.status, 200);
+  assert.equal(entriesBefore.data.length, 1);
+  assert.equal(entriesBefore.data[0].values.campus_name, 'Synthetic north campus');
+  const summaryRoute = '/v1/admin/tenant/collections/' + collectionId + '/summary';
+  const summaryBefore = await call(summaryRoute, 'GET', undefined, {}, true);
+  assert.equal(summaryBefore.r.status, 200);
+  assert.equal(summaryBefore.data.total, 1);
+  assert.deepEqual(summaryBefore.data.byVersion, [{ version: 1, count: 1 }]);
+  assert.ok(!JSON.stringify(summaryBefore.data).includes('Synthetic north campus'));
+
+  const statusField = {
+    key: 'campus_status',
+    label: 'Campus status',
+    kind: 'choice',
+    required: true,
+    options: ['Pending', 'Approved'],
+  };
+  const revisionRoute = '/v1/admin/tenant/collections/' + collectionId + '/revisions';
+  const blockedRemoval = await call(
+    revisionRoute,
+    'POST',
+    { expectedVersion: 1, title: 'Campus checklist', fields: [statusField] },
+    {},
+    true,
+  );
+  assert.equal(blockedRemoval.r.status, 409);
+  const updatedCollection = await call(
+    revisionRoute,
+    'POST',
+    { expectedVersion: 1, title: 'Campus checklist', fields: [campusField, statusField] },
+    {},
+    true,
+  );
+  assert.equal(updatedCollection.r.status, 201, JSON.stringify(updatedCollection.data));
+  assert.equal(updatedCollection.data.version, 2);
+  const staleCollection = await call(
+    revisionRoute,
+    'POST',
+    { expectedVersion: 1, title: 'Campus checklist', fields: [campusField, statusField] },
+    {},
+    true,
+  );
+  assert.equal(staleCollection.r.status, 409);
+  const versions = await call(
+    '/v1/admin/tenant/collections/' + collectionId + '/versions',
+    'GET',
+    undefined,
+    {},
+    true,
+  );
+  assert.equal(versions.r.status, 200);
+  assert.deepEqual(
+    versions.data.map((v: any) => v.version),
+    [2, 1],
+  );
+  const oldRecord = await call(
+    recordsRoute,
+    'POST',
+    { ...recordInput, submissionKey: randomUUID() },
+    {},
+    true,
+  );
+  assert.equal(oldRecord.r.status, 409);
+  const missingChoice = await call(
+    recordsRoute,
+    'POST',
+    { version: 2, submissionKey: randomUUID(), values: { campus_name: 'South campus' } },
+    {},
+    true,
+  );
+  assert.equal(missingChoice.r.status, 422);
+  const validRecord = await call(
+    recordsRoute,
+    'POST',
+    {
+      version: 2,
+      submissionKey: randomUUID(),
+      values: { campus_name: 'Synthetic south campus', campus_status: 'Approved' },
+    },
+    {},
+    true,
+  );
+  assert.equal(validRecord.r.status, 201, JSON.stringify(validRecord.data));
+  const entriesAfter = await call(recordsRoute, 'GET', undefined, {}, true);
+  assert.equal(entriesAfter.data.length, 2);
+  assert.ok(entriesAfter.data.some((r: any) => r.schemaVersion === 1));
+  assert.ok(entriesAfter.data.some((r: any) => r.schemaVersion === 2));
+  const summaryAfter = await call(summaryRoute, 'GET', undefined, {}, true);
+  assert.equal(summaryAfter.r.status, 200);
+  assert.equal(summaryAfter.data.total, 2);
+  assert.equal(summaryAfter.data.currentVersion, 2);
+  assert.deepEqual(summaryAfter.data.byVersion, [
+    { version: 1, count: 1 },
+    { version: 2, count: 1 },
+  ]);
+
+  // Institution overview is available but never aggregates shared legacy
+  // lead, audit or outbox records from the primary workspace.
+  const institutionOverview = await call('/v1/admin/overview', 'GET', undefined, {}, true);
+  assert.equal(institutionOverview.r.status, 200, JSON.stringify(institutionOverview.data));
+  assert.equal(institutionOverview.data.scope, 'institution');
+  assert.equal(institutionOverview.data.stats.published, 0);
+  assert.equal(institutionOverview.data.stats.leads, 0);
+  assert.equal(institutionOverview.data.stats.new_leads, 0);
+  assert.equal(institutionOverview.data.stats.open_tasks, 0);
+  assert.equal(institutionOverview.data.stats.attention, 0);
+  const isolatedCheckoutQueue = await call(
+    '/v1/admin/fees/checkout-sessions',
+    'GET',
+    undefined,
+    {},
+    true,
+  );
+  assert.equal(isolatedCheckoutQueue.r.status, 200);
+  assert.deepEqual(isolatedCheckoutQueue.data, []);
+
+  // Shared legacy administration remains inaccessible to institutions.
+  for (const route of [
+    '/v1/admin/audit',
+    '/v1/admin/outbox',
+    '/v1/admin/conversations',
+    '/v1/admin/privacy-requests',
+    '/v1/admin/settings',
+  ]) {
+    const denied = await call(route, 'GET', undefined, {}, true);
+    assert.equal(denied.r.status, 403, route + ': ' + JSON.stringify(denied.data));
+  }
+  // Tenant ownership applies to workflow definitions and follow-up tasks.
+  const emptyWorkflows = await call('/v1/admin/workflows', 'GET', undefined, {}, true);
+  assert.equal(emptyWorkflows.r.status, 200);
+  assert.deepEqual(emptyWorkflows.data, []);
+  const emptyTasks = await call('/v1/admin/tasks', 'GET', undefined, {}, true);
+  assert.equal(emptyTasks.r.status, 200);
+  assert.deepEqual(emptyTasks.data, []);
+  const emptyRuns = await call('/v1/admin/workflows/runs', 'GET', undefined, {}, true);
+  assert.equal(emptyRuns.r.status, 200);
+  assert.deepEqual(emptyRuns.data, []);
+
+  const primaryDefinition = {
+    name: 'Primary-only workflow',
+    nodes: [{ type: 'task', title: 'Primary only' }],
+  };
+  const primaryWorkflow = await owner.query(
+    'INSERT INTO workflows(definition,created_by,tenant_id) VALUES($1,$2,$3) RETURNING id',
+    [primaryDefinition, user.id, primaryTenantId],
+  );
+  const primaryRoute = '/v1/admin/workflows/' + primaryWorkflow.rows[0].id;
+  const deniedToggle = await call(
+    primaryRoute,
+    'PATCH',
+    { active: true, expectedVersion: 1 },
+    {},
+    true,
+  );
+  assert.equal(deniedToggle.r.status, 409);
+
+  const secondaryDefinition = {
+    name: 'Secondary follow-up',
+    nodes: [{ type: 'task', title: 'Secondary only' }],
+  };
+  const secondaryWorkflow = await call(
+    '/v1/admin/workflows',
+    'POST',
+    secondaryDefinition,
+    {},
+    true,
+  );
+  assert.equal(secondaryWorkflow.r.status, 201);
+  assert.equal(secondaryWorkflow.data.tenant_id, secondaryTenantId);
+  secondaryWorkflowId = secondaryWorkflow.data.id;
+  const secondaryRoute = '/v1/admin/workflows/' + secondaryWorkflowId;
+  const activated = await call(
+    secondaryRoute,
+    'PATCH',
+    { active: true, expectedVersion: 1 },
+    {},
+    true,
+  );
+  assert.equal(activated.r.status, 200);
+  const tenantWorkflows = await call('/v1/admin/workflows', 'GET', undefined, {}, true);
+  assert.equal(tenantWorkflows.data.length, 1);
+  assert.equal(tenantWorkflows.data[0].id, secondaryWorkflowId);
+
+  // Campaign URLs and reads must never cross tenant boundaries.
+  const primaryCampaign = (
+    await owner.query(
+      'INSERT INTO campaigns(definition,url,created_by,tenant_id) VALUES($1,$2,$3,$4) RETURNING id',
+      [
+        {
+          name: 'Primary QA campaign',
+          path: '/',
+          source: 'google',
+          medium: 'cpc',
+          campaign: 'primary_qa',
+        },
+        process.env.SITE_URL,
+        user.id,
+        primaryTenantId,
+      ],
+    )
+  ).rows[0];
+  const emptyCampaigns = await call('/v1/admin/campaigns', 'GET', undefined, {}, true);
+  assert.equal(emptyCampaigns.r.status, 200);
+  assert.deepEqual(emptyCampaigns.data, []);
+  const campaignInput = {
+    name: 'Secondary QA campaign',
+    path: '/',
+    source: 'google',
+    medium: 'cpc',
+    campaign: 'secondary_qa',
+  };
+  const unavailable = await call('/v1/admin/campaigns', 'POST', campaignInput, {}, true);
+  assert.equal(unavailable.r.status, 409);
+
+  // A synthetic, explicitly active tenant domain is used only in this test.
+  await owner.query(
+    "INSERT INTO tenant_domains(tenant_id,hostname,challenge,created_by,status) VALUES($1,$2,$3,$4,'active')",
+    [secondaryTenantId, 'qa-' + randomUUID().slice(0, 8) + '.example.test', 'qa-only', user.id],
+  );
+  const createdCampaign = await call('/v1/admin/campaigns', 'POST', campaignInput, {}, true);
+  assert.equal(createdCampaign.r.status, 201, JSON.stringify(createdCampaign.data));
+  assert.equal(createdCampaign.data.tenant_id, secondaryTenantId);
+  assert.ok(new URL(createdCampaign.data.url).hostname.endsWith('.example.test'));
+  assert.equal(new URL(createdCampaign.data.url).searchParams.get('utm_campaign'), 'secondary_qa');
+  const tenantCampaigns = await call('/v1/admin/campaigns', 'GET', undefined, {}, true);
+  assert.equal(tenantCampaigns.r.status, 200);
+  assert.equal(tenantCampaigns.data.length, 1);
+  assert.equal(tenantCampaigns.data[0].id, createdCampaign.data.id);
+  assert.notEqual(createdCampaign.data.id, primaryCampaign.id);
+
+  // Tenant-owned CRM is available in both workspaces, but the secondary tenant
+  // must never see or mutate the primary tenant's lead records.
+  const isolatedLeads = await call('/v1/admin/leads', 'GET', undefined, {}, true);
+  assert.equal(isolatedLeads.r.status, 200);
+  assert.deepEqual(isolatedLeads.data, []);
+  const primaryLead = (
+    await owner.query('SELECT id FROM leads WHERE tenant_id=$1 ORDER BY created_at DESC LIMIT 1', [
+      primaryTenantId,
+    ])
+  ).rows[0];
+  if (primaryLead) {
+    const crossStage = await call(
+      '/v1/admin/leads/' + primaryLead.id + '/stage',
+      'POST',
+      { stage: 'contacted', expectedVersion: 1, reason: 'Cross tenant denied' },
+      {},
+      true,
+    );
+    assert.equal(crossStage.r.status, 409);
+  }
+  const isolatedExport = await call('/v1/admin/leads/export', 'POST', {}, {}, true);
+  assert.equal(isolatedExport.r.status, 201);
+  assert.ok(!String(isolatedExport.data).includes('Synthetic QA Institute'));
+
+  const isolatedMedia = await call('/v1/admin/media', 'GET', undefined, {}, true);
+  assert.equal(isolatedMedia.r.status, 200);
+  assert.deepEqual(isolatedMedia.data, []);
+
+  // Tenant-owned CMS permits isolated workspaces, without leaking legacy pages.
+  const isolatedContent = await call('/v1/admin/content', 'GET', undefined, {}, true);
+  assert.equal(isolatedContent.r.status, 200);
+  assert.deepEqual(isolatedContent.data, []);
+  const primaryPage = (
+    await owner.query(
+      'SELECT id,slug,kind,draft FROM content WHERE tenant_id=$1 ORDER BY slug LIMIT 1',
+      [primaryTenantId],
+    )
+  ).rows[0];
+  assert.ok(primaryPage, 'Seeded public website must include a page');
+  const deniedDetail = await call(
+    '/v1/admin/content/' + primaryPage.id,
+    'GET',
+    undefined,
+    {},
+    true,
+  );
+  assert.equal(deniedDetail.r.status, 404);
+
+  // Two institutions may use the same page path without overwriting one another.
+  const secondaryPage = await call(
+    '/v1/admin/content',
+    'POST',
+    { slug: primaryPage.slug, kind: primaryPage.kind, body: primaryPage.draft },
+    {},
+    true,
+  );
+  assert.equal(secondaryPage.r.status, 201, JSON.stringify(secondaryPage.data));
+  assert.equal(secondaryPage.data.tenant_id, secondaryTenantId);
+  assert.notEqual(secondaryPage.data.id, primaryPage.id);
+  const duplicate = await call(
+    '/v1/admin/content',
+    'POST',
+    { slug: primaryPage.slug, kind: primaryPage.kind, body: primaryPage.draft },
+    {},
+    true,
+  );
+  assert.equal(duplicate.r.status, 409);
+  const isolatedDetails = await call(
+    '/v1/admin/content/' + secondaryPage.data.id,
+    'GET',
+    undefined,
+    {},
+    true,
+  );
+  assert.equal(isolatedDetails.r.status, 200);
+  // Public pages must resolve exclusively through their active institution domain.
+  const tenantHostname = new URL(createdCampaign.data.url).hostname;
+  await owner.query("UPDATE tenants SET status='pilot' WHERE id=$1", [secondaryTenantId]);
+  const publishedRevision = (
+    await owner.query(
+      'INSERT INTO revisions(content_id,body,created_by) VALUES($1,$2,$3) RETURNING id',
+      [secondaryPage.data.id, primaryPage.draft, user.id],
+    )
+  ).rows[0];
+  await owner.query("UPDATE content SET published_revision=$2,state='published' WHERE id=$1", [
+    secondaryPage.data.id,
+    publishedRevision.id,
+  ]);
+  const scopedSite = await call('/v1/public/site?hostname=' + tenantHostname);
+  assert.equal(scopedSite.r.status, 200);
+  assert.equal(scopedSite.data.tenantSite, true);
+  assert.equal(scopedSite.data.indexing, false);
+  assert.equal(scopedSite.data.settings.form, null);
+  assert.equal(scopedSite.data.settings.brand.name, 'Synthetic Second Workspace');
+  const scopedPages = await call('/v1/public/pages?hostname=' + tenantHostname);
+  assert.equal(scopedPages.r.status, 200);
+  assert.equal(scopedPages.data.length, 1);
+  assert.equal(scopedPages.data[0].id, secondaryPage.data.id);
+  const scopedPathQuery = new URLSearchParams({
+    path: primaryPage.slug,
+    hostname: tenantHostname,
+  });
+  const scopedPath = await call('/v1/public/pages/by-path?' + scopedPathQuery);
+  assert.equal(scopedPath.r.status, 200);
+  assert.equal(scopedPath.data.id, secondaryPage.data.id);
+  const unknownDomain = await call('/v1/public/pages?hostname=unregistered.example.test');
+  assert.equal(unknownDomain.r.status, 404);
+  const invalidDomain = await call('/v1/public/site?hostname=example.test:443');
+  assert.equal(invalidDomain.r.status, 404);
+  const originalPages = await call('/v1/public/pages');
+  assert.equal(originalPages.r.status, 200);
+  assert.ok(!originalPages.data.some((page: any) => page.id === secondaryPage.data.id));
+
+  // Institution-specific intake is disabled until the workspace owner activates it.
+  const tenantPayload = {
+    hostname: tenantHostname,
+    revision: 1,
+    name: 'QA Enquiry Visitor',
+    email: 'tenant-visitor@example.invalid',
+    phone: '+919999999999',
+    message: 'Please contact me about admission availability.',
+    noticeAccepted: true,
+    website: '',
+  };
+  const tenantOrigin = { Origin: 'https://' + tenantHostname };
+  const disabledEnquiry = await call('/v1/forms/tenant/submissions', 'POST', tenantPayload, {
+    ...tenantOrigin,
+    'Idempotency-Key': randomUUID(),
+  });
+  assert.equal(disabledEnquiry.r.status, 404);
+
+  const settings = await call(
+    '/v1/admin/tenant/enquiry-form',
+    'POST',
+    {
+      title: 'Contact this institution',
+      notice: 'I consent to this institution storing my details to respond to my enquiry.',
+      success: 'Institution staff will review your enquiry.',
+      enabled: true,
+    },
+    {},
+    true,
+  );
+  assert.equal(settings.r.status, 201, JSON.stringify(settings.data));
+  assert.equal(settings.data.enabled, true);
+  const enabledSite = await call('/v1/public/site?hostname=' + tenantHostname);
+  assert.equal(enabledSite.r.status, 200);
+  assert.equal(enabledSite.data.settings.form.revision, settings.data.revision);
+  assert.equal(enabledSite.data.indexing, false);
+
+  const activePayload = { ...tenantPayload, revision: settings.data.revision };
+  const enquiryKey = randomUUID();
+  const accepted = await call('/v1/forms/tenant/submissions', 'POST', activePayload, {
+    ...tenantOrigin,
+    'Idempotency-Key': enquiryKey,
+  });
+  assert.equal(accepted.r.status, 201, JSON.stringify(accepted.data));
+  assert.equal(accepted.data.status, 'accepted');
+  const replay = await call('/v1/forms/tenant/submissions', 'POST', activePayload, {
+    ...tenantOrigin,
+    'Idempotency-Key': enquiryKey,
+  });
+  assert.equal(replay.r.status, 201);
+  assert.equal(replay.data.replayed, true);
+  assert.equal(replay.data.receipt, accepted.data.receipt);
+  const conflict = await call(
+    '/v1/forms/tenant/submissions',
+    'POST',
+    { ...activePayload, name: 'Changed Person' },
+    { ...tenantOrigin, 'Idempotency-Key': enquiryKey },
+  );
+  assert.equal(conflict.r.status, 409);
+  const wrongOrigin = await call('/v1/forms/tenant/submissions', 'POST', activePayload, {
+    Origin: process.env.SITE_URL!,
+    'Idempotency-Key': randomUUID(),
+  });
+  assert.equal(wrongOrigin.r.status, 403);
+
+  const firstAnalytics = await call(
+    '/v1/admin/tenant/enquiries/analytics?days=7',
+    'GET',
+    undefined,
+    {},
+    true,
+  );
+  assert.equal(firstAnalytics.r.status, 200);
+  assert.match(String(firstAnalytics.r.headers.get('cache-control')), /no-store/);
+  assert.equal(firstAnalytics.data.received, 1);
+  assert.equal(firstAnalytics.data.waiting, 1);
+  assert.equal(firstAnalytics.data.byStage.new, 1);
+  assert.equal(firstAnalytics.data.daily.length, 7);
+  assert.equal(
+    firstAnalytics.data.daily.reduce((sum: number, row: any) => sum + row.count, 0),
+    1,
+  );
+  assert.ok(!JSON.stringify(firstAnalytics.data).includes('tenant-visitor@example.invalid'));
+  const invalidAnalytics = await call(
+    '/v1/admin/tenant/enquiries/analytics?days=365',
+    'GET',
+    undefined,
+    {},
+    true,
+  );
+  assert.equal(invalidAnalytics.r.status, 422);
+
+  const tenantEnquiries = await call('/v1/admin/tenant/enquiries', 'GET', undefined, {}, true);
+  assert.equal(tenantEnquiries.r.status, 200);
+  assert.equal(tenantEnquiries.data.length, 1);
+  assert.equal(tenantEnquiries.data[0].fields.name, activePayload.name);
+  assert.equal(tenantEnquiries.data[0].receipt, accepted.data.receipt);
+  const encrypted = (
+    await owner.query('SELECT encrypted_fields,tenant_id FROM tenant_enquiries WHERE receipt=$1', [
+      accepted.data.receipt,
+    ])
+  ).rows[0];
+  assert.equal(encrypted.tenant_id, secondaryTenantId);
+  assert.ok(!encrypted.encrypted_fields.includes(activePayload.name));
+  // The intake lifecycle uses tenant-scoped optimistic locking and encrypted staff notes.
+  const recordId = tenantEnquiries.data[0].id;
+  const reviewed = await call(
+    '/v1/admin/tenant/enquiries/' + recordId + '/stage',
+    'POST',
+    { stage: 'contacted', expectedVersion: 1, reason: 'Called from synthetic QA queue' },
+    {},
+    true,
+  );
+  assert.equal(reviewed.r.status, 201, JSON.stringify(reviewed.data));
+  assert.equal(reviewed.data.version, 2);
+  const stale = await call(
+    '/v1/admin/tenant/enquiries/' + recordId + '/stage',
+    'POST',
+    { stage: 'qualified', expectedVersion: 1, reason: 'Must reject stale update' },
+    {},
+    true,
+  );
+  assert.equal(stale.r.status, 409);
+  const invalidMove = await call(
+    '/v1/admin/tenant/enquiries/' + recordId + '/stage',
+    'POST',
+    { stage: 'new', expectedVersion: 2, reason: 'Unapproved backward transition' },
+    {},
+    true,
+  );
+  assert.equal(invalidMove.r.status, 409);
+  const changed = await call('/v1/admin/tenant/enquiries', 'GET', undefined, {}, true);
+  assert.equal(changed.data[0].stage, 'contacted');
+  assert.equal(changed.data[0].version, 2);
+  const reviewedAnalytics = await call(
+    '/v1/admin/tenant/enquiries/analytics?days=30',
+    'GET',
+    undefined,
+    {},
+    true,
+  );
+  assert.equal(reviewedAnalytics.r.status, 200);
+  assert.equal(reviewedAnalytics.data.received, 1);
+  assert.equal(reviewedAnalytics.data.waiting, 0);
+  assert.equal(reviewedAnalytics.data.reviewed, 1);
+  assert.equal(reviewedAnalytics.data.byStage.contacted, 1);
+  const recordHistory = await call(
+    '/v1/admin/tenant/enquiries/' + recordId + '/history',
+    'GET',
+    undefined,
+    {},
+    true,
+  );
+  assert.equal(recordHistory.r.status, 200);
+  assert.equal(recordHistory.data.length, 1);
+  assert.equal(recordHistory.data[0].reason, 'Called from synthetic QA queue');
+  const storedNote = (
+    await owner.query(
+      'SELECT encrypted_reason,tenant_id FROM tenant_enquiry_activities WHERE enquiry_id=$1',
+      [recordId],
+    )
+  ).rows[0];
+  assert.equal(storedNote.tenant_id, secondaryTenantId);
+  assert.ok(!storedNote.encrypted_reason.includes('synthetic QA queue'));
+  const foreignHistory = await call(
+    '/v1/admin/tenant/enquiries/' + randomUUID() + '/history',
+    'GET',
+    undefined,
+    {},
+    true,
+  );
+  assert.equal(foreignHistory.r.status, 404);
+  // Protected CSV contains only this workspace's encrypted enquiries.
+  const scopedExport = await call('/v1/admin/tenant/enquiries/export', 'POST', {}, {}, true);
+  assert.ok(scopedExport.r.status >= 200 && scopedExport.r.status < 300);
+  assert.match(String(scopedExport.r.headers.get('content-type')), /text\/csv/);
+  assert.match(String(scopedExport.r.headers.get('cache-control')), /no-store/);
+  assert.match(String(scopedExport.data), /QA Enquiry Visitor/);
+  assert.match(String(scopedExport.data), /contacted/);
+  assert.ok(!String(scopedExport.data).includes('Called from synthetic QA queue'));
+
+  // In-app notifications come only from committed, tenant-owned enquiry events.
+  const beforeNotification = await call(
+    '/v1/admin/tenant/notifications',
+    'GET',
+    undefined,
+    {},
+    true,
+  );
+  assert.equal(beforeNotification.r.status, 200);
+  assert.deepEqual(beforeNotification.data, []);
+  await tick(db);
+  const projectedNotifications = await call(
+    '/v1/admin/tenant/notifications',
+    'GET',
+    undefined,
+    {},
+    true,
+  );
+  assert.equal(projectedNotifications.r.status, 200);
+  assert.equal(projectedNotifications.data.length, 1);
+  const notification = projectedNotifications.data[0];
+  assert.equal(notification.read, false);
+  assert.equal(notification.enquiryId, recordId);
+  assert.match(notification.title, /New institution enquiry ENQ-/);
+  assert.ok(!JSON.stringify(notification).includes(activePayload.email));
+  const unreadOverview = await call('/v1/admin/overview', 'GET', undefined, {}, true);
+  assert.equal(unreadOverview.data.scope, 'institution');
+  assert.equal(unreadOverview.data.stats.attention, 1);
+  const notificationRead = await call(
+    '/v1/admin/tenant/notifications/' + notification.id + '/read',
+    'POST',
+    {},
+    {},
+    true,
+  );
+  assert.equal(notificationRead.r.status, 201);
+  assert.equal(notificationRead.data.status, 'read');
+  const repeatedRead = await call(
+    '/v1/admin/tenant/notifications/' + notification.id + '/read',
+    'POST',
+    {},
+    {},
+    true,
+  );
+  assert.equal(repeatedRead.r.status, 201);
+  const afterNotification = await call(
+    '/v1/admin/tenant/notifications',
+    'GET',
+    undefined,
+    {},
+    true,
+  );
+  assert.equal(afterNotification.data[0].read, true);
+  const readOverview = await call('/v1/admin/overview', 'GET', undefined, {}, true);
+  assert.equal(readOverview.data.stats.attention, 0);
+  await tick(db);
+  const eventNotifications = await db.query(
+    'SELECT id FROM tenant_inbox_notifications WHERE source_event_id=$1',
+    [accepted.data.eventId],
+  );
+  assert.equal(eventNotifications.length, 1);
+  await assert.rejects(
+    owner.query(
+      'INSERT INTO tenant_inbox_notifications(tenant_id,source_event_id,enquiry_id,title) VALUES($1,$2,$3,$4)',
+      [primaryTenantId, randomUUID(), recordId, 'Cross-tenant alert must fail'],
+    ),
+    { code: '23503' },
+  );
+
+  const reviewTasks = await call('/v1/admin/tasks', 'GET', undefined, {}, true);
+  assert.ok(reviewTasks.data.some((task: any) => task.title.includes(accepted.data.receipt)));
+  // Institution owners can publish bounded custom questions without losing earlier versions.
+  const questions = [
+    {
+      key: 'preferred_campus',
+      label: 'Preferred campus',
+      kind: 'choice',
+      required: true,
+      options: ['North', 'South'],
+    },
+    {
+      key: 'additional_details',
+      label: 'Additional details',
+      kind: 'long_text',
+      required: false,
+      options: [],
+    },
+  ];
+  const customSettings = {
+    title: 'Contact this institution',
+    notice: 'I consent to this institution storing my details to respond to my enquiry.',
+    success: 'Institution staff will review your enquiry.',
+    enabled: true,
+    expectedRevision: settings.data.revision,
+    fields: questions,
+  };
+  const invalidQuestions = await call(
+    '/v1/admin/tenant/enquiry-form',
+    'POST',
+    { ...customSettings, fields: [questions[0], questions[0]] },
+    {},
+    true,
+  );
+  assert.equal(invalidQuestions.r.status, 422);
+  const reservedQuestion = await call(
+    '/v1/admin/tenant/enquiry-form',
+    'POST',
+    { ...customSettings, fields: [{ ...questions[0], key: 'email' }] },
+    {},
+    true,
+  );
+  assert.equal(reservedQuestion.r.status, 422);
+  const configuredForm = await call(
+    '/v1/admin/tenant/enquiry-form',
+    'POST',
+    customSettings,
+    {},
+    true,
+  );
+  assert.equal(configuredForm.r.status, 201, JSON.stringify(configuredForm.data));
+  assert.equal(configuredForm.data.revision, settings.data.revision + 1);
+  assert.equal(configuredForm.data.fields.length, 2);
+  const staleFormSave = await call(
+    '/v1/admin/tenant/enquiry-form',
+    'POST',
+    customSettings,
+    {},
+    true,
+  );
+  assert.equal(staleFormSave.r.status, 409);
+  const newSite = await call('/v1/public/site?hostname=' + tenantHostname);
+  assert.equal(newSite.r.status, 200);
+  assert.deepEqual(newSite.data.settings.form.fields, questions);
+  const historicalForm = (
+    await owner.query(
+      'SELECT definition FROM tenant_form_revisions WHERE tenant_id=$1 AND revision=$2',
+      [secondaryTenantId, settings.data.revision],
+    )
+  ).rows[0];
+  assert.deepEqual(historicalForm.definition.fields, []);
+  const rejectedStaleRevision = await call('/v1/forms/tenant/submissions', 'POST', activePayload, {
+    ...tenantOrigin,
+    'Idempotency-Key': randomUUID(),
+  });
+  assert.equal(rejectedStaleRevision.r.status, 422);
+  const nextPayload = { ...activePayload, revision: configuredForm.data.revision };
+  const missingRequired = await call('/v1/forms/tenant/submissions', 'POST', nextPayload, {
+    ...tenantOrigin,
+    'Idempotency-Key': randomUUID(),
+  });
+  assert.equal(missingRequired.r.status, 422);
+  const injectedAnswer = await call(
+    '/v1/forms/tenant/submissions',
+    'POST',
+    { ...nextPayload, answers: { unknown_key: 'Hidden' } },
+    { ...tenantOrigin, 'Idempotency-Key': randomUUID() },
+  );
+  assert.equal(injectedAnswer.r.status, 422);
+  const invalidChoice = await call(
+    '/v1/forms/tenant/submissions',
+    'POST',
+    { ...nextPayload, answers: { preferred_campus: 'Unapproved campus' } },
+    { ...tenantOrigin, 'Idempotency-Key': randomUUID() },
+  );
+  assert.equal(invalidChoice.r.status, 422);
+  const validCustom = await call(
+    '/v1/forms/tenant/submissions',
+    'POST',
+    {
+      ...nextPayload,
+      answers: { preferred_campus: 'North', additional_details: 'Synthetic QA enquiry' },
+    },
+    { ...tenantOrigin, 'Idempotency-Key': randomUUID() },
+  );
+  assert.equal(validCustom.r.status, 201, JSON.stringify(validCustom.data));
+  const encryptedCustom = (
+    await owner.query(
+      'SELECT encrypted_fields,form_revision FROM tenant_enquiries WHERE receipt=$1',
+      [validCustom.data.receipt],
+    )
+  ).rows[0];
+  assert.equal(encryptedCustom.form_revision, configuredForm.data.revision);
+  assert.ok(!encryptedCustom.encrypted_fields.includes('Synthetic QA enquiry'));
+  const customEnquiries = await call('/v1/admin/tenant/enquiries', 'GET', undefined, {}, true);
+  const customRow = customEnquiries.data.find(
+    (row: any) => row.receipt === validCustom.data.receipt,
+  );
+  assert.equal(customRow.fields.answers.preferred_campus, 'North');
+  const customAnalytics = await call(
+    '/v1/admin/tenant/enquiries/analytics?days=90',
+    'GET',
+    undefined,
+    {},
+    true,
+  );
+  assert.equal(customAnalytics.r.status, 200);
+  assert.equal(customAnalytics.data.received, 2);
+  assert.equal(customAnalytics.data.byStage.new, 1);
+  assert.equal(customAnalytics.data.byStage.contacted, 1);
+  assert.equal(customAnalytics.data.daily.length, 90);
+
+  const publicPage = await call(
+    '/v1/public/pages/by-path?path=' + encodeURIComponent(primaryPage.slug),
+  );
+  assert.equal(publicPage.r.status, 200);
+  assert.equal(publicPage.data.id, primaryPage.id);
+
+  const deniedExport = await call('/v1/admin/content-export', 'POST', {}, {}, true);
+  assert.equal(deniedExport.r.status, 403);
+
+  // Shared outbox and global branding mutations remain fail-closed.
+  for (const [route, method, payload] of [
+    ['/v1/admin/outbox/' + randomUUID() + '/retry', 'POST', {}],
+    ['/v1/admin/settings/brand', 'PATCH', {}],
+  ] as const) {
+    const denied = await call(route, method, payload, {}, true);
+    assert.equal(denied.r.status, 403, route + ': ' + JSON.stringify(denied.data));
+  }
+
+  const back = await call(
+    '/v1/auth/switch-tenant',
+    'POST',
+    { tenantId: primaryTenantId },
+    {},
+    true,
+  );
+  assert.equal(back.r.status, 201, JSON.stringify(back.data));
+  assert.equal(back.data.tenant.id, primaryTenantId);
+  const otherTenantExport = await call('/v1/admin/tenant/enquiries/export', 'POST', {}, {}, true);
+  assert.ok(otherTenantExport.r.status >= 200 && otherTenantExport.r.status < 300);
+  assert.ok(!String(otherTenantExport.data).includes('QA Enquiry Visitor'));
+
+  const otherTenantAnalytics = await call(
+    '/v1/admin/tenant/enquiries/analytics?days=30',
+    'GET',
+    undefined,
+    {},
+    true,
+  );
+  assert.equal(otherTenantAnalytics.r.status, 200);
+  assert.equal(otherTenantAnalytics.data.received, 0);
+  assert.ok(!JSON.stringify(otherTenantAnalytics.data).includes('tenant-visitor@example.invalid'));
+  const foreignSummary = await call(summaryRoute, 'GET', undefined, {}, true);
+  assert.equal(foreignSummary.r.status, 404);
+  const otherTenantNotifications = await call(
+    '/v1/admin/tenant/notifications',
+    'GET',
+    undefined,
+    {},
+    true,
+  );
+  assert.equal(otherTenantNotifications.r.status, 200);
+  assert.deepEqual(otherTenantNotifications.data, []);
+  const deniedNotificationRead = await call(
+    '/v1/admin/tenant/notifications/' + notification.id + '/read',
+    'POST',
+    {},
+    {},
+    true,
+  );
+  assert.equal(deniedNotificationRead.r.status, 404);
+  // Changing workspace must not reveal or mutate the other tenant's custom collections.
+  const foreignCollections = await call('/v1/admin/tenant/collections', 'GET', undefined, {}, true);
+  assert.equal(foreignCollections.r.status, 200);
+  assert.ok(!foreignCollections.data.some((row: any) => row.id === collectionId));
+  const foreignEntries = await call(recordsRoute, 'GET', undefined, {}, true);
+  assert.equal(foreignEntries.r.status, 404);
+  const foreignVersions = await call(
+    '/v1/admin/tenant/collections/' + collectionId + '/versions',
+    'GET',
+    undefined,
+    {},
+    true,
+  );
+  assert.equal(foreignVersions.r.status, 404);
+  const foreignRevision = await call(
+    revisionRoute,
+    'POST',
+    { expectedVersion: 2, title: 'Foreign mutation', fields: [campusField, statusField] },
+    {},
+    true,
+  );
+  assert.equal(foreignRevision.r.status, 404);
+  const foreignRecord = await call(
+    recordsRoute,
+    'POST',
+    {
+      version: 2,
+      submissionKey: randomUUID(),
+      values: { campus_name: 'Cross-tenant', campus_status: 'Pending' },
+    },
+    {},
+    true,
+  );
+  assert.equal(foreignRecord.r.status, 404);
+  await assert.rejects(
+    owner.query(
+      `INSERT INTO tenant_collection_entries(
+         tenant_id,collection_id,schema_version,submission_key,fingerprint,encrypted_data,created_by
+       ) VALUES($1,$2,2,$3,'invalid', 'encrypted', $4)`,
+      [primaryTenantId, collectionId, randomUUID(), user.id],
+    ),
+    { code: '23503' },
+  );
+
+  // The original institution cannot read or modify the secondary institution's review.
+  const foreignTenantHistory = await call(
+    '/v1/admin/tenant/enquiries/' + recordId + '/history',
+    'GET',
+    undefined,
+    {},
+    true,
+  );
+  assert.equal(foreignTenantHistory.r.status, 404);
+  const foreignTenantChange = await call(
+    '/v1/admin/tenant/enquiries/' + recordId + '/stage',
+    'POST',
+    { stage: 'qualified', expectedVersion: 2, reason: 'Cross-tenant attempt' },
+    {},
+    true,
+  );
+  assert.equal(foreignTenantChange.r.status, 409);
+});
+
+test('tenant organisation, brand and maker-checker role controls are functional', async () => {
+  const overview = await call('/v1/admin/tenant/overview', 'GET', undefined, {}, true);
+  assert.equal(overview.r.status, 200, JSON.stringify(overview.data));
+  assert.equal(overview.data.tenant.id, primaryTenantId);
+  assert.equal(overview.data.workspaceRole, 'owner');
+  assert.ok(overview.data.permissionCatalogue.includes('role.publish'));
+
+  const onboarding = await call(
+    '/v1/admin/tenant/onboarding',
+    'POST',
+    {
+      section: 'organisation',
+      data: {
+        legalName: 'Synthetic Education Trust',
+        institutionType: 'school',
+        intendedCollectionModel: 'one_time_and_recurring',
+        supportEmail: 'support@example.invalid',
+      },
+    },
+    {},
+    true,
+  );
+  assert.equal(onboarding.r.status, 201, JSON.stringify(onboarding.data));
+  assert.equal(onboarding.data.current_step, 'organisation');
+
+  const entity = await call(
+    '/v1/admin/tenant/organisation/entities',
+    'POST',
+    {
+      name: 'Synthetic Education Trust',
+      registrationReference: 'SYNTH-REG-001',
+      taxReferenceMasked: 'GST-***001',
+    },
+    {},
+    true,
+  );
+  assert.equal(entity.r.status, 201, JSON.stringify(entity.data));
+
+  const branch = await call(
+    '/v1/admin/tenant/organisation/branches',
+    'POST',
+    {
+      legalEntityId: entity.data.id,
+      code: 'MAIN',
+      name: 'Main Campus',
+      city: 'Test City',
+      state: 'Test State',
+    },
+    {},
+    true,
+  );
+  assert.equal(branch.r.status, 201, JSON.stringify(branch.data));
+  assert.equal(branch.data.tenant_id, primaryTenantId);
+
+  const year = await call(
+    '/v1/admin/tenant/organisation/academic-years',
+    'POST',
+    {
+      label: '2026-27',
+      startsOn: '2026-04-01',
+      endsOn: '2027-03-31',
+    },
+    {},
+    true,
+  );
+  assert.equal(year.r.status, 201, JSON.stringify(year.data));
+
+  const brand = await call(
+    '/v1/admin/tenant/brand',
+    'POST',
+    {
+      name: 'Synthetic Academy Payments',
+      primaryColour: '#0f766e',
+      accentColour: '#f97316',
+      supportEmail: 'support@example.invalid',
+      locale: 'en-IN',
+    },
+    {},
+    true,
+  );
+  assert.equal(brand.r.status, 201, JSON.stringify(brand.data));
+  assert.equal(brand.data.status, 'draft');
+
+  const domain = await call(
+    '/v1/admin/tenant/domains',
+    'POST',
+    { hostname: 'fees.synthetic-example.invalid' },
+    {},
+    true,
+  );
+  assert.equal(domain.r.status, 201, JSON.stringify(domain.data));
+  assert.equal(domain.data.status, 'pending');
+  assert.equal(domain.data.dns.type, 'TXT');
+  assert.match(domain.data.dns.value, /^platform-verify=/);
+
+  const role = await call(
+    '/v1/admin/tenant/roles',
+    'POST',
+    {
+      roleKey: 'qa_reconciler',
+      name: 'QA Reconciler',
+      description: 'Synthetic restricted reconciliation role',
+      grants: ['tenant.read', 'fee.read', 'reconciliation.read'],
+      explicitDenies: ['refund.approve'],
+    },
+    {},
+    true,
+  );
+  assert.equal(role.r.status, 201, JSON.stringify(role.data));
+  assert.equal(role.data.status, 'draft');
+
+  const requested = await call(
+    '/v1/admin/tenant/roles/' + role.data.id + '/request-publish',
+    'POST',
+    {},
+    {},
+    true,
+  );
+  assert.equal(requested.r.status, 201, JSON.stringify(requested.data));
+  assert.equal(requested.data.status, 'pending');
+
+  const selfApproval = await call(
+    '/v1/admin/tenant/approvals/' + requested.data.id + '/decide',
+    'POST',
+    { decision: 'approve', reason: 'Synthetic self approval must be rejected' },
+    {},
+    true,
+  );
+  assert.equal(selfApproval.r.status, 403);
+
+  const latest = await call('/v1/admin/tenant/overview', 'GET', undefined, {}, true);
+  assert.equal(latest.r.status, 200, JSON.stringify(latest.data));
+  assert.ok(latest.data.entities.some((row: any) => row.id === entity.data.id));
+  assert.ok(latest.data.branches.some((row: any) => row.id === branch.data.id));
+  assert.ok(latest.data.roles.some((row: any) => row.id === role.data.id));
+  assert.ok(latest.data.approvals.some((row: any) => row.id === requested.data.id));
+});
+
+test('CSRF prevents authenticated writes', async () => {
+  const r = await call('/v1/admin/campaigns', 'POST', {}, { Cookie: cookie });
+  assert.equal(r.r.status, 403);
+});
+test('consent denial does not prevent a committed lead', async () => {
+  const r = await call('/v1/forms/demo/submissions', 'POST', input, { 'Idempotency-Key': key });
+  assert.equal(r.r.status, 201, JSON.stringify(r.data));
+  receipt = r.data.receipt;
+  eventId = r.data.eventId;
+  const rows = await db.query('SELECT * FROM leads WHERE event_id=$1', [eventId]);
+  assert.equal(rows.length, 1);
+  leadId = rows[0]!.id;
+  assert.equal(rows[0]!.acquisition_id, null);
+  assert.ok(!rows[0]!.encrypted_fields.includes(input.email));
+  assert.equal((await db.query('SELECT * FROM outbox WHERE event_id=$1', [eventId])).length, 1);
+});
+test('concurrent retries produce one lead and one event', async () => {
+  const replies = await Promise.all(
+    Array.from({ length: 12 }, () =>
+      call('/v1/forms/demo/submissions', 'POST', input, { 'Idempotency-Key': key }),
+    ),
+  );
+  for (const r of replies) {
+    assert.equal(r.data.receipt, receipt);
+    assert.equal(r.data.eventId, eventId);
+  }
+  assert.equal((await db.query('SELECT * FROM leads WHERE submission_key=$1', [key])).length, 1);
+});
+test('same key with different data conflicts', async () =>
+  assert.equal(
+    (
+      await call(
+        '/v1/forms/demo/submissions',
+        'POST',
+        { ...input, name: 'Different' },
+        { 'Idempotency-Key': key },
+      )
+    ).r.status,
+    409,
+  ));
+test('invalid form produces no accepted lead', async () => {
+  const k = randomUUID();
+  assert.equal(
+    (
+      await call(
+        '/v1/forms/demo/submissions',
+        'POST',
+        { ...input, email: 'bad' },
+        { 'Idempotency-Key': k },
+      )
+    ).r.status,
+    422,
+  );
+  assert.equal((await db.query('SELECT * FROM leads WHERE submission_key=$1', [k])).length, 0);
+});
+test('audit failure rolls back lead and outbox', async () => {
+  await owner.query(
+    "CREATE FUNCTION qa_fail_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.action='lead.accepted' THEN RAISE EXCEPTION 'QA controlled audit failure'; END IF; RETURN NEW; END $$; CREATE TRIGGER qa_fail_audit BEFORE INSERT ON audit FOR EACH ROW EXECUTE FUNCTION qa_fail_audit();",
+  );
+  const k = randomUUID();
+  try {
+    const r = await call('/v1/forms/demo/submissions', 'POST', input, { 'Idempotency-Key': k });
+    assert.equal(r.r.status, 500);
+    assert.equal((await db.query('SELECT * FROM leads WHERE submission_key=$1', [k])).length, 0);
+  } finally {
+    await owner.query('DROP TRIGGER qa_fail_audit ON audit; DROP FUNCTION qa_fail_audit();');
+  }
+});
+test('worker retries cannot duplicate follow-up tasks', async () => {
+  await tick(db);
+  await db.query("UPDATE outbox SET status='pending' WHERE event_id=$1", [eventId]);
+  await tick(db);
+  assert.equal(
+    (await db.query('SELECT * FROM tasks WHERE execution_key=$1', ['lead:' + eventId])).length,
+    1,
+  );
+  assert.equal(
+    (await db.query('SELECT status FROM outbox WHERE event_id=$1', [eventId]))[0]!.status,
+    'blocked',
+  );
+});
+test('background workflow enrollment rejects cross-institution lead references', async () => {
+  assert.ok(secondaryWorkflowId);
+  assert.ok(leadId);
+  await tick(db);
+  const foreignRuns = await db.query('SELECT id FROM workflow_runs WHERE workflow_id=$1', [
+    secondaryWorkflowId,
+  ]);
+  assert.deepEqual(foreignRuns, []);
+
+  const badDefinition = { name: 'Wrong tenant', nodes: [{ type: 'task', title: 'Must reject' }] };
+  const wrongRunSql =
+    'INSERT INTO workflow_runs(workflow_id,lead_id,definition,tenant_id) VALUES($1,$2,$3,$4)';
+  await assert.rejects(
+    owner.query(wrongRunSql, [secondaryWorkflowId, leadId, badDefinition, secondaryTenantId]),
+    { code: '23503' },
+  );
+  const wrongTaskSql =
+    'INSERT INTO tasks(lead_id,title,execution_key,tenant_id) VALUES($1,$2,$3,$4)';
+  const taskKey = 'qa-cross-tenant-' + randomUUID();
+  await assert.rejects(
+    owner.query(wrongTaskSql, [leadId, 'Forbidden task', taskKey, secondaryTenantId]),
+    { code: '23503' },
+  );
+});
+
+test('expired worker lease is recovered', async () => {
+  await db.query(
+    "UPDATE outbox SET status='processing',lease_until=now()-interval '1 minute' WHERE event_id=$1",
+    [eventId],
+  );
+  await tick(db);
+  assert.equal(
+    (await db.query('SELECT status FROM outbox WHERE event_id=$1', [eventId]))[0]!.status,
+    'blocked',
+  );
+});
+test('create draft, preserve private/public boundary', async () => {
+  const r = await call(
+    '/v1/admin/content',
+    'POST',
+    {
+      slug: '/qa-page-' + randomUUID().slice(0, 8) + '/',
+      kind: 'post',
+      body: {
+        title: 'QA private draft',
+        description: 'A synthetic unpublished draft for verification.',
+        blocks: [
+          {
+            id: 'qa-hero',
+            type: 'hero',
+            title: 'Private draft',
+            text: 'Do not expose this before publication.',
+          },
+        ],
+      },
+    },
+    {},
+    true,
+  );
+  assert.equal(r.r.status, 201, JSON.stringify(r.data));
+  contentId = r.data.id;
+  version = r.data.version;
+  const publicRows = (await call('/v1/public/pages')).data;
+  assert.ok(!publicRows.some((p: any) => p.id === contentId));
+});
+test('stale CMS write rejected without lost update', async () => {
+  const current = (await call('/v1/admin/content/' + contentId, 'GET', undefined, {}, true)).data;
+  const r = await call(
+    '/v1/admin/content/' + contentId + '/draft',
+    'PATCH',
+    { expectedVersion: version, body: { ...current.draft, title: 'QA updated draft' } },
+    {},
+    true,
+  );
+  assert.equal(r.r.status, 200);
+  assert.equal(
+    (
+      await call(
+        '/v1/admin/content/' + contentId + '/draft',
+        'PATCH',
+        { expectedVersion: version, body: current.draft },
+        {},
+        true,
+      )
+    ).r.status,
+    409,
+  );
+  version = r.data.version;
+});
+test('review and approval are required before publication', async () => {
+  assert.equal(
+    (
+      await call(
+        '/v1/admin/content/' + contentId + '/action',
+        'POST',
+        { action: 'publish', expectedVersion: version, reason: 'QA check' },
+        {},
+        true,
+      )
+    ).r.status,
+    409,
+  );
+  for (const action of ['review', 'approve', 'publish']) {
+    const r = await call(
+      '/v1/admin/content/' + contentId + '/action',
+      'POST',
+      { action, expectedVersion: version, reason: 'QA approved synthetic content' },
+      {},
+      true,
+    );
+    assert.equal(r.r.status, 201, JSON.stringify(r.data));
+    version = r.data.version;
+  }
+  const rows = (await call('/v1/public/pages')).data;
+  assert.ok(rows.some((p: any) => p.id === contentId && p.body.title === 'QA updated draft'));
+});
+test('published revisions are immutable at the database', async () => {
+  await assert.rejects(db.query("UPDATE revisions SET body='{}' WHERE content_id=$1", [contentId]));
+  await assert.rejects(db.query('DELETE FROM content WHERE id=$1', [contentId]));
+  await assert.rejects(db.query('TRUNCATE audit'));
+});
+test('manual trash removes public access but retains source', async () => {
+  const r = await call(
+    '/v1/admin/content/' + contentId + '/action',
+    'POST',
+    { action: 'trash', expectedVersion: version, reason: 'QA manual preservation exercise' },
+    {},
+    true,
+  );
+  assert.equal(r.r.status, 201);
+  version = r.data.version;
+  assert.ok(!(await call('/v1/public/pages')).data.some((p: any) => p.id === contentId));
+  await owner.query("UPDATE content SET deleted_at=now()-interval '2 years' WHERE id=$1", [
+    contentId,
+  ]);
+  await tick(db);
+  assert.equal(
+    (await db.query('SELECT * FROM revisions WHERE content_id=$1', [contentId])).length,
+    1,
+  );
+});
+test('manual restore returns to unpublished draft', async () => {
+  const r = await call(
+    '/v1/admin/content/' + contentId + '/action',
+    'POST',
+    { action: 'restore', expectedVersion: version, reason: 'QA restore' },
+    {},
+    true,
+  );
+  assert.equal(r.r.status, 201);
+  assert.equal(r.data.published_revision, null);
+  assert.equal(r.data.state, 'draft');
+});
+test('browser cannot assert purchase or include PII', async () => {
+  for (const body of [
+    { id: randomUUID(), name: 'purchase', route: '/', occurredAt: new Date().toISOString() },
+    {
+      id: randomUUID(),
+      name: 'page_view',
+      route: '/',
+      occurredAt: new Date().toISOString(),
+      email: 'private@example.invalid',
+    },
+  ])
+    assert.equal((await call('/v1/events', 'POST', body)).r.status, 422);
+});
+test('event collection is denied before consent', async () =>
+  assert.equal(
+    (
+      await call('/v1/events', 'POST', {
+        id: randomUUID(),
+        name: 'page_view',
+        route: '/',
+        occurredAt: new Date().toISOString(),
+      })
+    ).r.status,
+    403,
+  ));
+test('consent, event dedupe and attribution sanitisation', async () => {
+  const r = await call('/v1/consent/choices', 'POST', {
+    analytics: true,
+    advertising: false,
+    policyVersion: '2026-10-v1',
+  });
+  consentCookie = r.r.headers.getSetCookie()[0]!.split(';')[0]!;
+  const event = {
+    id: randomUUID(),
+    name: 'page_view',
+    route: '/',
+    occurredAt: new Date().toISOString(),
+  };
+  await call('/v1/events', 'POST', event, { Cookie: consentCookie });
+  await call('/v1/events', 'POST', event, { Cookie: consentCookie });
+  assert.equal((await db.query('SELECT * FROM events WHERE id=$1', [event.id])).length, 1);
+  const t = await call(
+    '/v1/attribution/touches',
+    'POST',
+    {
+      route: '/',
+      fields: {
+        utm_source: 'google',
+        utm_campaign: 'safe_campaign',
+        utm_content: 'private@example.invalid',
+      },
+    },
+    { Cookie: consentCookie },
+  );
+  assert.equal(t.r.status, 201);
+  const touch = (await db.query('SELECT * FROM acquisition WHERE id=$1', [t.data.reference]))[0]!;
+  assert.deepEqual(touch.fields, { utm_source: 'google', utm_campaign: 'safe_campaign' });
+  const sensitive = await call(
+    '/v1/attribution/touches',
+    'POST',
+    { route: '/privacy', fields: { utm_source: 'google' } },
+    { Cookie: consentCookie },
+  );
+  assert.equal(sensitive.r.status, 201);
+  assert.deepEqual(sensitive.data, { status: 'suppressed', reason: 'sensitive_route' });
+  for (const route of ['/payer', '/payer/receipts', '/checkout/pay', '/payments/status']) {
+    const blockedEventId = randomUUID();
+    const blockedEvent = await call(
+      '/v1/events',
+      'POST',
+      { id: blockedEventId, name: 'page_view', route, occurredAt: new Date().toISOString() },
+      { Cookie: consentCookie },
+    );
+    assert.deepEqual(blockedEvent.data, { status: 'suppressed', reason: 'sensitive_route' });
+    assert.equal((await db.query('SELECT id FROM events WHERE id=$1', [blockedEventId])).length, 0);
+    const blockedTouch = await call(
+      '/v1/attribution/touches',
+      'POST',
+      { route, fields: { utm_source: 'google' } },
+      { Cookie: consentCookie },
+    );
+    assert.deepEqual(blockedTouch.data, { status: 'suppressed', reason: 'sensitive_route' });
+  }
+});
+
+test('withdrawal stops further events', async () => {
+  await call(
+    '/v1/consent/choices',
+    'POST',
+    { analytics: false, advertising: false, policyVersion: '2026-10-v1' },
+    { Cookie: consentCookie },
+  );
+  assert.equal(
+    (
+      await call(
+        '/v1/events',
+        'POST',
+        { id: randomUUID(), name: 'page_view', route: '/', occurredAt: new Date().toISOString() },
+        { Cookie: consentCookie },
+      )
+    ).r.status,
+    403,
+  );
+});
+test('chat requires a scoped operational session', async () => {
+  assert.equal((await call('/v1/chat/messages')).r.status, 403);
+  const r = await call('/v1/chat/start', 'POST', {});
+  chatCookie = r.r.headers.getSetCookie()[0]!.split(';')[0]!;
+  const message = await call(
+    '/v1/chat/messages',
+    'POST',
+    { clientId: randomUUID(), topic: 'Flex' },
+    { Cookie: chatCookie },
+  );
+  assert.equal(message.r.status, 201);
+  assert.match(message.data.answer, /instalments|scheduled/i);
+
+  const messageId = randomUUID();
+  const first = await call(
+    '/v1/chat/messages',
+    'POST',
+    { clientId: messageId, topic: 'Pay' },
+    { Cookie: chatCookie },
+  );
+  assert.equal(first.r.status, 201);
+  const replay = await call(
+    '/v1/chat/messages',
+    'POST',
+    { clientId: messageId, topic: 'Pay' },
+    { Cookie: chatCookie },
+  );
+  assert.equal(replay.r.status, 201);
+  assert.equal(replay.data.answer, first.data.answer);
+  const conflict = await call(
+    '/v1/chat/messages',
+    'POST',
+    { clientId: messageId, topic: 'Cred' },
+    { Cookie: chatCookie },
+  );
+  assert.equal(conflict.r.status, 409);
+});
+test('chat lead uses same durable capture and a conversation link', async () => {
+  const r = await call(
+    '/v1/chat/leads',
+    'POST',
+    { ...input, source: 'chat' },
+    { Cookie: chatCookie, 'Idempotency-Key': randomUUID() },
+  );
+  assert.equal(r.r.status, 201);
+  const lead = (await db.query('SELECT * FROM leads WHERE event_id=$1', [r.data.eventId]))[0]!;
+  assert.ok(lead.chat_id);
+});
+test('handoff request is not represented as an agent joining', async () => {
+  const r = await call('/v1/chat/handoff', 'POST', {}, { Cookie: chatCookie });
+  assert.equal(r.data.status, 'awaiting_agent');
+  assert.match(r.data.message, /No agent has joined/);
+});
+test('workflow enrollment and task actions remain idempotent', async () => {
+  const taskTitle = 'QA task ' + randomUUID();
+  const workflow = await call(
+    '/v1/admin/workflows',
+    'POST',
+    {
+      name: 'QA follow-up',
+      nodes: [{ type: 'task', title: taskTitle }, { type: 'exit_if_contacted' }],
+    },
+    {},
+    true,
+  );
+  await call(
+    '/v1/admin/workflows/' + workflow.data.id,
+    'PATCH',
+    { active: true, expectedVersion: 1 },
+    {},
+    true,
+  );
+  const r = await call('/v1/forms/demo/submissions', 'POST', input, {
+    'Idempotency-Key': randomUUID(),
+  });
+  await tick(db);
+  await tick(db);
+  const id = (await db.query('SELECT id FROM leads WHERE event_id=$1', [r.data.eventId]))[0]!.id;
+  assert.equal(
+    (await db.query('SELECT * FROM tasks WHERE lead_id=$1 AND title=$2', [id, taskTitle])).length,
+    1,
+  );
+});
+test('lead qualification requires audited stage transitions', async () => {
+  assert.equal(
+    (
+      await call(
+        '/v1/admin/leads/' + leadId + '/stage',
+        'POST',
+        { stage: 'won', expectedVersion: 1, reason: 'invalid shortcut' },
+        {},
+        true,
+      )
+    ).r.status,
+    409,
+  );
+  await call(
+    '/v1/admin/leads/' + leadId + '/stage',
+    'POST',
+    { stage: 'contacted', expectedVersion: 1, reason: 'Synthetic operator contact' },
+    {},
+    true,
+  );
+  const r = await call(
+    '/v1/admin/leads/' + leadId + '/stage',
+    'POST',
+    { stage: 'qualified', expectedVersion: 2, reason: 'Synthetic business review' },
+    {},
+    true,
+  );
+  assert.equal(r.r.status, 201);
+  assert.equal(
+    (
+      await db.query("SELECT * FROM outbox WHERE aggregate_id=$1 AND type='lead.qualified'", [
+        leadId,
+      ])
+    ).length,
+    1,
+  );
+});
+test('staff SMTP acceptance is recorded once without customer PII', async () => {
+  let messages = 0;
+  const bodies: string[] = [];
+  const server = createServer((socket) => {
+    socket.write('220 local-test ESMTP\r\n');
+    let buffer = '',
+      data = false,
+      body = '';
+    socket.on('data', (chunk) => {
+      buffer += chunk.toString();
+      while (buffer.includes('\r\n')) {
+        const i = buffer.indexOf('\r\n'),
+          line = buffer.slice(0, i);
+        buffer = buffer.slice(i + 2);
+        if (data) {
+          if (line === '.') {
+            data = false;
+            messages++;
+            bodies.push(body);
+            body = '';
+            socket.write('250 queued\r\n');
+          } else body += line + '\n';
+        } else if (/^EHLO|^HELO/.test(line)) socket.write('250-local-test\r\n250 SIZE 1000000\r\n');
+        else if (/^DATA/.test(line)) {
+          data = true;
+          socket.write('354 send data\r\n');
+        } else if (/^QUIT/.test(line)) {
+          socket.end('221 bye\r\n');
+        } else socket.write('250 OK\r\n');
+      }
+    });
+  });
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+  const port = (server.address() as { port: number }).port;
+  const original = { ...process.env };
+  Object.assign(process.env, {
+    NOTIFICATION_MODE: 'smtp',
+    SMTP_HOST: '127.0.0.1',
+    SMTP_PORT: String(port),
+    SMTP_FROM: 'staff@example.invalid',
+    NOTIFICATION_TO: 'owner@example.invalid',
+  });
+  try {
+    const id = randomUUID();
+    assert.equal(await notifyStaff(db, id), 'provider_accepted');
+    assert.equal(await notifyStaff(db, id), 'provider_accepted');
+    assert.equal(messages, 1);
+    assert.ok(!bodies.join('').includes(input.email));
+  } finally {
+    for (const k of [
+      'NOTIFICATION_MODE',
+      'SMTP_HOST',
+      'SMTP_PORT',
+      'SMTP_FROM',
+      'NOTIFICATION_TO',
+    ]) {
+      if (original[k] === undefined) delete process.env[k];
+      else process.env[k] = original[k];
+    }
+    await new Promise<void>((r) => server.close(() => r()));
+  }
+});
+test('audit checkpoint is signed without claiming independent storage', async () => {
+  const r = await checkpoint(db);
+  assert.ok(r.count > 0);
+  assert.match(r.filename, /^audit-/);
+});
+
+test('academic customer context is tenant-scoped, relationship-explicit and import-safe', async () => {
+  const branchRow = (
+    await db.query('SELECT id FROM branches WHERE tenant_id=$1 ORDER BY created_at LIMIT 1', [
+      primaryTenantId,
+    ])
+  )[0]!;
+  const yearRow = (
+    await db.query('SELECT id FROM academic_years WHERE tenant_id=$1 ORDER BY created_at LIMIT 1', [
+      primaryTenantId,
+    ])
+  )[0]!;
+
+  const studentRef = 'STU-' + randomUUID().slice(0, 8);
+  const student = await call(
+    '/v1/admin/academic/students',
+    'POST',
+    {
+      studentReference: studentRef,
+      fullName: 'Synthetic Learner',
+      branchId: branchRow.id,
+      academicYearId: yearRow.id,
+    },
+    {},
+    true,
+  );
+  assert.equal(student.r.status, 201, JSON.stringify(student.data));
+  assert.equal(student.data.tenant_id, primaryTenantId);
+
+  const guardian = await call(
+    '/v1/admin/academic/guardians',
+    'POST',
+    {
+      displayName: 'Synthetic Guardian',
+      email: 'guardian@example.invalid',
+    },
+    {},
+    true,
+  );
+  assert.equal(guardian.r.status, 201, JSON.stringify(guardian.data));
+  assert.equal(guardian.data.verification_status, 'unverified');
+
+  const relationship = await call(
+    '/v1/admin/academic/students/' + student.data.id + '/guardians',
+    'POST',
+    {
+      guardianId: guardian.data.id,
+      relationship: 'guardian',
+      payerRole: 'primary',
+      verified: true,
+    },
+    {},
+    true,
+  );
+  assert.equal(relationship.r.status, 201, JSON.stringify(relationship.data));
+  assert.equal(relationship.data.visibility_status, 'active');
+
+  const catalogue = await call(
+    '/v1/admin/academic/catalogue',
+    'POST',
+    {
+      kind: 'course',
+      code: 'COURSE-' + randomUUID().slice(0, 6),
+      label: 'Synthetic Course',
+    },
+    {},
+    true,
+  );
+  assert.equal(catalogue.r.status, 201, JSON.stringify(catalogue.data));
+
+  const assignment = await call(
+    '/v1/admin/academic/students/' + student.data.id + '/catalogue',
+    'POST',
+    { catalogueId: catalogue.data.id, effectiveOn: '2026-04-01' },
+    {},
+    true,
+  );
+  assert.equal(assignment.r.status, 201, JSON.stringify(assignment.data));
+
+  const detail = await call(
+    '/v1/admin/academic/students/' + student.data.id,
+    'GET',
+    undefined,
+    {},
+    true,
+  );
+  assert.equal(detail.r.status, 200, JSON.stringify(detail.data));
+  assert.equal(detail.data.relationships.length, 1);
+  assert.equal(detail.data.assignments.length, 1);
+
+  const importedRef = 'IMP-' + randomUUID().slice(0, 8);
+  const previewBody = {
+    sourceSystem: 'synthetic_erp',
+    rows: [
+      {
+        studentReference: importedRef,
+        fullName: 'Imported Student',
+        externalId: 'ERP-' + randomUUID().slice(0, 8),
+      },
+      {
+        studentReference: importedRef,
+        fullName: 'Duplicate Imported Student',
+      },
+    ],
+  };
+  const preview = await call('/v1/admin/academic/imports/preview', 'POST', previewBody, {}, true);
+  assert.equal(preview.r.status, 201, JSON.stringify(preview.data));
+  assert.equal(preview.data.batch.valid_count, 1);
+  assert.equal(preview.data.batch.error_count, 1);
+
+  const previewReplay = await call(
+    '/v1/admin/academic/imports/preview',
+    'POST',
+    previewBody,
+    {},
+    true,
+  );
+  assert.equal(previewReplay.r.status, 201, JSON.stringify(previewReplay.data));
+  assert.equal(previewReplay.data.replayed, true);
+  assert.equal(previewReplay.data.batch.id, preview.data.batch.id);
+
+  const committed = await call(
+    '/v1/admin/academic/imports/' + preview.data.batch.id + '/commit',
+    'POST',
+    {},
+    {},
+    true,
+  );
+  assert.equal(committed.r.status, 201, JSON.stringify(committed.data));
+  assert.equal(committed.data.committed_count, 1);
+  assert.equal(committed.data.status, 'partial_failed');
+
+  const switched = await call(
+    '/v1/auth/switch-tenant',
+    'POST',
+    { tenantId: secondaryTenantId },
+    {},
+    true,
+  );
+  assert.equal(switched.r.status, 201, JSON.stringify(switched.data));
+
+  const secondaryOverview = await call('/v1/admin/academic/overview', 'GET', undefined, {}, true);
+  assert.equal(secondaryOverview.r.status, 200, JSON.stringify(secondaryOverview.data));
+  assert.ok(!secondaryOverview.data.students.some((row: any) => row.id === student.data.id));
+
+  const crossTenantDetail = await call(
+    '/v1/admin/academic/students/' + student.data.id,
+    'GET',
+    undefined,
+    {},
+    true,
+  );
+  assert.equal(crossTenantDetail.r.status, 409);
+
+  const sameContactDifferentWorkspace = await call(
+    '/v1/admin/academic/guardians',
+    'POST',
+    {
+      displayName: 'Independent Guardian Identity',
+      email: 'guardian@example.invalid',
+    },
+    {},
+    true,
+  );
+  assert.equal(
+    sameContactDifferentWorkspace.r.status,
+    201,
+    JSON.stringify(sameContactDifferentWorkspace.data),
+  );
+  assert.equal(sameContactDifferentWorkspace.data.tenant_id, secondaryTenantId);
+
+  const back = await call(
+    '/v1/auth/switch-tenant',
+    'POST',
+    { tenantId: primaryTenantId },
+    {},
+    true,
+  );
+  assert.equal(back.r.status, 201, JSON.stringify(back.data));
+});
+
+test('fee plans require maker-checker approval and project receivables safely', async () => {
+  const student = await call(
+    '/v1/admin/academic/students',
+    'POST',
+    {
+      studentReference: 'PLAN-' + randomUUID().slice(0, 8),
+      fullName: 'Synthetic Fee Plan Student',
+    },
+    {},
+    true,
+  );
+  assert.equal(student.r.status, 201, JSON.stringify(student.data));
+
+  const planKey = 'plan_' + randomUUID().slice(0, 8);
+  const plan = await call(
+    '/v1/admin/fee-plans',
+    'POST',
+    {
+      planKey,
+      name: 'Synthetic Annual Fee Plan',
+      components: [{ code: 'tuition', label: 'Tuition', amountMinor: 100000, category: 'fee' }],
+      installments: [
+        { dueDate: '2027-01-10', amountMinor: 50000 },
+        { dueDate: '2027-02-10', amountMinor: 50000 },
+      ],
+      eligibility: {},
+      note: 'Synthetic fee-plan fixture',
+    },
+    {},
+    true,
+  );
+  assert.equal(plan.r.status, 201, JSON.stringify(plan.data));
+  assert.equal(plan.data.status, 'draft');
+
+  const validated = await call(
+    '/v1/admin/fee-plans/' + plan.data.id + '/validate',
+    'POST',
+    {},
+    {},
+    true,
+  );
+  assert.equal(validated.r.status, 201, JSON.stringify(validated.data));
+  assert.equal(validated.data.status, 'validated');
+
+  const requested = await call(
+    '/v1/admin/fee-plans/' + plan.data.id + '/request-approval',
+    'POST',
+    {},
+    {},
+    true,
+  );
+  assert.equal(requested.r.status, 201, JSON.stringify(requested.data));
+  assert.equal(requested.data.status, 'pending_approval');
+
+  const selfApproval = await call(
+    '/v1/admin/fee-plans/' + plan.data.id + '/approve',
+    'POST',
+    {},
+    {},
+    true,
+  );
+  assert.equal(selfApproval.r.status, 409);
+
+  const originalCookie = cookie;
+  const originalCsrf = csrf;
+  const checkerEmail = 'checker-' + randomUUID().slice(0, 8) + '@example.invalid';
+  const checkerPassword = 'Checker-' + randomUUID() + '-Password!';
+  const checkerTotp = authenticator.generateSecret();
+  const checkerUser = (
+    await owner.query(
+      `INSERT INTO users(email,password_hash,totp_secret,role,active)
+       VALUES($1,$2,$3,'owner',true)
+       RETURNING id`,
+      [checkerEmail, await argon2.hash(checkerPassword), encrypt(checkerTotp)],
+    )
+  ).rows[0]!;
+  await owner.query(
+    `INSERT INTO memberships(tenant_id,user_id,role_key,status)
+     VALUES($1,$2,'owner','active')`,
+    [primaryTenantId, checkerUser.id],
+  );
+
+  const checkerLogin = await call('/v1/auth/login', 'POST', {
+    email: checkerEmail,
+    password: checkerPassword,
+    otp: authenticator.generate(checkerTotp),
+  });
+  assert.equal(checkerLogin.r.status, 201, JSON.stringify(checkerLogin.data));
+  cookie = checkerLogin.r.headers.getSetCookie()[0]!.split(';')[0]!;
+  csrf = checkerLogin.data.csrf;
+
+  const approved = await call(
+    '/v1/admin/fee-plans/' + plan.data.id + '/approve',
+    'POST',
+    {},
+    {},
+    true,
+  );
+  assert.equal(approved.r.status, 201, JSON.stringify(approved.data));
+  assert.equal(approved.data.status, 'approved');
+
+  const effective = await call(
+    '/v1/admin/fee-plans/' + plan.data.id + '/effective',
+    'POST',
+    {},
+    {},
+    true,
+  );
+  assert.equal(effective.r.status, 201, JSON.stringify(effective.data));
+  assert.equal(effective.data.status, 'effective');
+
+  cookie = originalCookie;
+  csrf = originalCsrf;
+
+  const assignment = await call(
+    '/v1/admin/fee-plans/' + plan.data.id + '/assign',
+    'POST',
+    {
+      studentId: student.data.id,
+      accountReference: 'PLANACC_' + randomUUID().slice(0, 8),
+    },
+    {},
+    true,
+  );
+  assert.equal(assignment.r.status, 201, JSON.stringify(assignment.data));
+  assert.equal(assignment.data.assignment.status, 'active');
+  const scheduleId = assignment.data.schedule.id;
+
+  const schedules = (await call('/v1/admin/fees/schedules', 'GET', undefined, {}, true)).data;
+  const assignedSchedule = schedules.find((row: any) => row.id === scheduleId);
+  assert.equal(assignedSchedule.status, 'active');
+  assert.equal(assignedSchedule.installments.length, 2);
+
+  const credit = await call(
+    '/v1/admin/fee-plans/credits',
+    'POST',
+    {
+      accountReference: assignment.data.schedule.account_reference,
+      source: 'external_advance',
+      amountMinor: 10000,
+      evidenceReference: 'ADV-' + randomUUID().slice(0, 8),
+      note: 'Synthetic confirmed advance',
+    },
+    {},
+    true,
+  );
+  assert.equal(credit.r.status, 201, JSON.stringify(credit.data));
+
+  const allocated = await call(
+    '/v1/admin/fee-plans/credits/' + credit.data.id + '/allocate',
+    'POST',
+    { installmentId: assignedSchedule.installments[0].id, amountMinor: 10000 },
+    {},
+    true,
+  );
+  assert.equal(allocated.r.status, 201, JSON.stringify(allocated.data));
+
+  const adjustment = await call(
+    '/v1/admin/fee-plans/adjustments',
+    'POST',
+    {
+      scheduleId,
+      kind: 'scholarship',
+      amountMinor: 15000,
+      reason: 'Synthetic approved scholarship',
+    },
+    {},
+    true,
+  );
+  assert.equal(adjustment.r.status, 201, JSON.stringify(adjustment.data));
+
+  cookie = checkerLogin.r.headers.getSetCookie()[0]!.split(';')[0]!;
+  csrf = checkerLogin.data.csrf;
+  const adjustmentApproved = await call(
+    '/v1/admin/fee-plans/adjustments/' + adjustment.data.id + '/decide',
+    'POST',
+    { decision: 'approve', reason: 'Independent checker approval' },
+    {},
+    true,
+  );
+  assert.equal(adjustmentApproved.r.status, 201, JSON.stringify(adjustmentApproved.data));
+  assert.equal(adjustmentApproved.data.status, 'approved');
+
+  cookie = originalCookie;
+  csrf = originalCsrf;
+  const adjustmentApplied = await call(
+    '/v1/admin/fee-plans/adjustments/' + adjustment.data.id + '/apply',
+    'POST',
+    {},
+    {},
+    true,
+  );
+  assert.equal(adjustmentApplied.r.status, 201, JSON.stringify(adjustmentApplied.data));
+  assert.equal(adjustmentApplied.data.status, 'applied');
+
+  const statement = await call(
+    '/v1/admin/fee-plans/statements/students/' + student.data.id,
+    'GET',
+    undefined,
+    {},
+    true,
+  );
+  assert.equal(statement.r.status, 200, JSON.stringify(statement.data));
+  assert.equal(statement.data.student.id, student.data.id);
+  assert.ok(statement.data.movements.some((row: any) => row.kind === 'adjustment'));
+
+  const ageing = await call('/v1/admin/fee-plans/receivables/ageing', 'GET', undefined, {}, true);
+  assert.equal(ageing.r.status, 200, JSON.stringify(ageing.data));
+
+  const change = await call(
+    '/v1/admin/fee-plans/changes',
+    'POST',
+    {
+      assignmentId: assignment.data.assignment.id,
+      scheduleId,
+      changeType: 'withdrawal',
+      reason: 'Synthetic withdrawal case',
+      payload: {},
+    },
+    {},
+    true,
+  );
+  assert.equal(change.r.status, 201, JSON.stringify(change.data));
+
+  cookie = checkerLogin.r.headers.getSetCookie()[0]!.split(';')[0]!;
+  csrf = checkerLogin.data.csrf;
+  const changeApproved = await call(
+    '/v1/admin/fee-plans/changes/' + change.data.id + '/decide',
+    'POST',
+    { decision: 'approve', reason: 'Independent withdrawal approval' },
+    {},
+    true,
+  );
+  assert.equal(changeApproved.r.status, 201, JSON.stringify(changeApproved.data));
+
+  cookie = originalCookie;
+  csrf = originalCsrf;
+  const executed = await call(
+    '/v1/admin/fee-plans/changes/' + change.data.id + '/execute',
+    'POST',
+    {},
+    {},
+    true,
+  );
+  assert.equal(executed.r.status, 201, JSON.stringify(executed.data));
+  assert.equal(executed.data.status, 'executed');
+
+  const assignmentRow = (
+    await db.query('SELECT status FROM student_fee_plan_assignments WHERE id=$1', [
+      assignment.data.assignment.id,
+    ])
+  )[0]!;
+  assert.equal(assignmentRow.status, 'withdrawn');
+
+  await owner.query('UPDATE sessions SET revoked_at=now() WHERE user_id=$1', [checkerUser.id]);
+});
+
+test('fee administration is isolated by active workspace', async () => {
+  assert.ok(primaryTenantId);
+  assert.ok(secondaryTenantId);
+
+  const sharedReference = 'tenant_scope_' + randomUUID().slice(0, 8);
+  const primarySchedule = await call(
+    '/v1/admin/fees/schedules',
+    'POST',
+    {
+      accountReference: sharedReference,
+      currency: 'INR',
+      note: 'Primary workspace isolation fixture',
+      installments: [{ dueDate: '2027-01-15', amountMinor: 50000 }],
+    },
+    {},
+    true,
+  );
+  assert.equal(primarySchedule.r.status, 201, JSON.stringify(primarySchedule.data));
+  assert.equal(primarySchedule.data.tenant_id, primaryTenantId);
+
+  const switched = await call(
+    '/v1/auth/switch-tenant',
+    'POST',
+    { tenantId: secondaryTenantId },
+    {},
+    true,
+  );
+  assert.equal(switched.r.status, 201, JSON.stringify(switched.data));
+
+  const secondaryList = await call('/v1/admin/fees/schedules', 'GET', undefined, {}, true);
+  assert.equal(secondaryList.r.status, 200, JSON.stringify(secondaryList.data));
+  assert.ok(!secondaryList.data.some((row: any) => row.id === primarySchedule.data.id));
+
+  const crossTenantActivation = await call(
+    '/v1/admin/fees/schedules/' + primarySchedule.data.id + '/activate',
+    'POST',
+    { expectedVersion: 1 },
+    {},
+    true,
+  );
+  assert.equal(crossTenantActivation.r.status, 409);
+
+  const secondaryPayer = await call(
+    '/v1/admin/payers',
+    'POST',
+    {
+      accountReference: sharedReference,
+      displayName: 'Secondary Tenant Payer',
+      email: 'secondary-payer@example.invalid',
+      preferredChannel: 'email',
+      locale: 'en-IN',
+    },
+    {},
+    true,
+  );
+  assert.equal(secondaryPayer.r.status, 201, JSON.stringify(secondaryPayer.data));
+
+  const secondarySchedule = await call(
+    '/v1/admin/fees/schedules',
+    'POST',
+    {
+      accountReference: sharedReference,
+      payerId: secondaryPayer.data.id,
+      currency: 'INR',
+      note: 'Secondary workspace isolation fixture',
+      installments: [{ dueDate: '2027-01-15', amountMinor: 50000 }],
+    },
+    {},
+    true,
+  );
+  assert.equal(secondarySchedule.r.status, 201, JSON.stringify(secondarySchedule.data));
+  assert.equal(secondarySchedule.data.tenant_id, secondaryTenantId);
+
+  const secondaryPayments = await call('/v1/admin/fees/payments', 'GET', undefined, {}, true);
+  assert.equal(secondaryPayments.r.status, 200, JSON.stringify(secondaryPayments.data));
+  assert.ok(
+    !secondaryPayments.data.some((row: any) => row.schedule_id === primarySchedule.data.id),
+  );
+
+  const back = await call(
+    '/v1/auth/switch-tenant',
+    'POST',
+    { tenantId: primaryTenantId },
+    {},
+    true,
+  );
+  assert.equal(back.r.status, 201, JSON.stringify(back.data));
+});
+
+test('fee schedule, payment evidence and refund remain auditable and balanced', async () => {
+  const created = await call(
+    '/v1/admin/fees/schedules',
+    'POST',
+    {
+      accountReference: 'qa_' + randomUUID().slice(0, 8),
+      currency: 'INR',
+      note: 'Synthetic integration schedule',
+      installments: [
+        { dueDate: '2027-01-10', amountMinor: 100000 },
+        { dueDate: '2027-02-10', amountMinor: 100000 },
+      ],
+    },
+    {},
+    true,
+  );
+  assert.equal(created.r.status, 201, JSON.stringify(created.data));
+  const scheduleId = created.data.id;
+  const activated = await call(
+    '/v1/admin/fees/schedules/' + scheduleId + '/activate',
+    'POST',
+    { expectedVersion: 1 },
+    {},
+    true,
+  );
+  assert.equal(activated.r.status, 201, JSON.stringify(activated.data));
+  const schedules = (await call('/v1/admin/fees/schedules', 'GET', undefined, {}, true)).data;
+  const schedule = schedules.find((s: any) => s.id === scheduleId);
+  assert.equal(schedule.status, 'active');
+  const installmentId = schedule.installments[0].id;
+  const payment = await call(
+    '/v1/admin/fees/payments/external-confirmation',
+    'POST',
+    {
+      installmentId,
+      amountMinor: 100000,
+      currency: 'INR',
+      providerReference: 'QA:' + randomUUID(),
+      idempotencyKey: randomUUID(),
+      evidenceNote: 'Synthetic bank confirmation',
+    },
+    {},
+    true,
+  );
+  assert.equal(payment.r.status, 201, JSON.stringify(payment.data));
+  const refund = await call(
+    '/v1/admin/fees/refunds',
+    'POST',
+    {
+      paymentId: payment.data.id,
+      amountMinor: 25000,
+      idempotencyKey: randomUUID(),
+      reason: 'Synthetic partial refund',
+    },
+    {},
+    true,
+  );
+  assert.equal(refund.r.status, 201, JSON.stringify(refund.data));
+  const row = (
+    await db.query(
+      `SELECT i.paid_amount_minor,p.refunded_amount_minor,p.status
+       FROM fee_installments i
+       JOIN payment_records p ON p.installment_id=i.id
+       WHERE p.id=$1`,
+      [payment.data.id],
+    )
+  )[0]!;
+  assert.equal(Number(row.paid_amount_minor), 75000);
+  assert.equal(Number(row.refunded_amount_minor), 25000);
+  assert.equal(row.status, 'partially_refunded');
+  assert.ok(
+    (
+      await db.query(
+        "SELECT * FROM outbox WHERE aggregate_id=$1 AND type='payment.external_confirmed'",
+        [payment.data.id],
+      )
+    ).length === 1,
+  );
+  assert.ok(
+    (
+      await db.query(
+        "SELECT * FROM audit WHERE object_id=$1 AND action='fees.payment.external_confirmed'",
+        [payment.data.id],
+      )
+    ).length === 1,
+  );
+});
+
+test('payer portal exposes only linked schedule data and queues reminders durably', async () => {
+  const ref = 'payer_' + randomUUID().slice(0, 8);
+  const payer = await call(
+    '/v1/admin/payers',
+    'POST',
+    {
+      accountReference: ref,
+      displayName: 'Synthetic Parent',
+      email: 'payer@example.invalid',
+      preferredChannel: 'email',
+      locale: 'en-IN',
+    },
+    {},
+    true,
+  );
+  assert.equal(payer.r.status, 201, JSON.stringify(payer.data));
+  const due = new Date();
+  due.setUTCDate(due.getUTCDate() + 3);
+  const dueDate = due.toISOString().slice(0, 10);
+  const schedule = await call(
+    '/v1/admin/fees/schedules',
+    'POST',
+    {
+      accountReference: ref,
+      payerId: payer.data.id,
+      currency: 'INR',
+      note: 'Synthetic payer portal schedule',
+      installments: [{ dueDate, amountMinor: 125000 }],
+    },
+    {},
+    true,
+  );
+  assert.equal(schedule.r.status, 201, JSON.stringify(schedule.data));
+  assert.equal(
+    (
+      await call(
+        '/v1/admin/fees/schedules/' + schedule.data.id + '/activate',
+        'POST',
+        { expectedVersion: 1 },
+        {},
+        true,
+      )
+    ).r.status,
+    201,
+  );
+  const link = await call(
+    '/v1/admin/fees/schedules/' + schedule.data.id + '/payer-link',
+    'POST',
+    { expiresHours: 1 },
+    {},
+    true,
+  );
+  assert.equal(link.r.status, 201, JSON.stringify(link.data));
+  const rawToken = String(link.data.path).split('/').filter(Boolean).pop()!;
+  const portal = await call('/v1/payer/' + rawToken);
+  assert.equal(portal.r.status, 200, JSON.stringify(portal.data));
+  assert.equal(portal.data.payer.accountReference, ref);
+  assert.equal(portal.data.installments.length, 1);
+  assert.ok(!JSON.stringify(portal.data).includes('payer@example.invalid'));
+
+  await tick(db);
+  const reminders = await db.query(
+    `SELECT c.status,c.kind,o.status AS outbox_status
+     FROM fee_communication_log c
+     JOIN outbox o ON o.event_id=c.event_id
+     WHERE c.schedule_id=$1 AND c.kind='upcoming_3d'`,
+    [schedule.data.id],
+  );
+  assert.equal(reminders.length, 1);
+  await tick(db);
+  assert.equal(
+    (
+      await db.query(
+        "SELECT count(*)::int AS count FROM fee_reminder_runs WHERE installment_id=(SELECT id FROM fee_installments WHERE schedule_id=$1 LIMIT 1) AND reminder_key='upcoming_3d'",
+        [schedule.data.id],
+      )
+    )[0]!.count,
+    1,
+  );
+
+  const revoked = await call(
+    '/v1/admin/fees/schedules/' + schedule.data.id + '/revoke-payer-links',
+    'POST',
+    {},
+    {},
+    true,
+  );
+  assert.equal(revoked.r.status, 201);
+  assert.equal((await call('/v1/payer/' + rawToken)).r.status, 409);
+});
+
+test('signed provider webhooks verify authenticity and apply payment exactly once', async () => {
+  const schedule = await call(
+    '/v1/admin/fees/schedules',
+    'POST',
+    {
+      accountReference: 'provider_' + randomUUID().slice(0, 8),
+      currency: 'INR',
+      note: 'Synthetic signed-provider schedule',
+      installments: [{ dueDate: '2027-06-10', amountMinor: 175000 }],
+    },
+    {},
+    true,
+  );
+  assert.equal(schedule.r.status, 201, JSON.stringify(schedule.data));
+  await call(
+    '/v1/admin/fees/schedules/' + schedule.data.id + '/activate',
+    'POST',
+    { expectedVersion: 1 },
+    {},
+    true,
+  );
+  const schedules = (await call('/v1/admin/fees/schedules', 'GET', undefined, {}, true)).data;
+  const active = schedules.find((s: any) => s.id === schedule.data.id);
+  const installmentId = active.installments[0].id;
+
+  const previous = {
+    mode: process.env.PAYMENT_PROVIDER_MODE,
+    name: process.env.PAYMENT_PROVIDER_NAME,
+    secret: process.env.PAYMENT_WEBHOOK_SECRET,
+  };
+  Object.assign(process.env, {
+    PAYMENT_PROVIDER_MODE: 'signed_hmac',
+    PAYMENT_PROVIDER_NAME: 'qa_gateway',
+    PAYMENT_WEBHOOK_SECRET: 'provider-webhook-test-secret-'.repeat(3),
+  });
+
+  const send = async (body: any, signatureOverride?: string) => {
+    const raw = JSON.stringify(body);
+    const timestamp = String(Math.floor(Date.now() / 1000));
+    const signature =
+      signatureOverride ||
+      createHmac('sha256', process.env.PAYMENT_WEBHOOK_SECRET!)
+        .update(timestamp)
+        .update('.')
+        .update(raw)
+        .digest('hex');
+    const r = await fetch(base + '/v1/provider/payments/webhook', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Payment-Timestamp': timestamp,
+        'X-Payment-Signature': signature,
+      },
+      body: raw,
+    });
+    return { r, data: await r.json() };
+  };
+
+  try {
+    const event = {
+      eventId: 'evt_' + randomUUID(),
+      type: 'payment_confirmed',
+      installmentId,
+      providerReference: 'pay_' + randomUUID(),
+      amountMinor: 175000,
+      currency: 'INR',
+      occurredAt: new Date().toISOString(),
+    };
+    const invalid = await send({ ...event, eventId: 'evt_' + randomUUID() }, '0'.repeat(64));
+    assert.equal(invalid.r.status, 403);
+
+    const first = await send(event);
+    assert.equal(first.r.status, 202, JSON.stringify(first.data));
+    assert.equal(first.data.status, 'applied');
+    const second = await send(event);
+    assert.equal(second.r.status, 202, JSON.stringify(second.data));
+    assert.equal(second.data.duplicate, true);
+
+    const payments = await db.query(
+      "SELECT * FROM payment_records WHERE provider='qa_gateway' AND provider_reference=$1",
+      [event.providerReference],
+    );
+    assert.equal(payments.length, 1);
+    assert.equal(payments[0]!.recorded_via, 'provider');
+    assert.equal(Number(payments[0]!.amount_minor), 175000);
+
+    const providerEvents = await db.query(
+      "SELECT * FROM payment_provider_events WHERE provider='qa_gateway' AND provider_event_id=$1",
+      [event.eventId],
+    );
+    assert.equal(providerEvents.length, 1);
+    assert.equal(providerEvents[0]!.status, 'applied');
+
+    const adminEvents = await call('/v1/admin/fees/provider-events', 'GET', undefined, {}, true);
+    assert.equal(adminEvents.r.status, 200);
+    assert.ok(adminEvents.data.some((row: any) => row.provider_event_id === event.eventId));
+  } finally {
+    for (const [key, value] of Object.entries({
+      PAYMENT_PROVIDER_MODE: previous.mode,
+      PAYMENT_PROVIDER_NAME: previous.name,
+      PAYMENT_WEBHOOK_SECRET: previous.secret,
+    })) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test('flexible fee components, concessions, analytics and late-fee assessment remain consistent', async () => {
+  const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const reference = 'structure_' + randomUUID().slice(0, 8);
+  const created = await call(
+    '/v1/admin/fees/schedules',
+    'POST',
+    {
+      accountReference: reference,
+      scopeType: 'course',
+      scopeReference: 'qa_course',
+      currency: 'INR',
+      components: [
+        { code: 'tuition', label: 'Tuition', amountMinor: 120000 },
+        {
+          code: 'transport',
+          label: 'Transport',
+          amountMinor: 30000,
+          bankRouteKey: 'transport_route',
+        },
+      ],
+      concessions: [
+        {
+          code: 'merit',
+          label: 'Merit scholarship',
+          amountMinor: 20000,
+          reason: 'Synthetic approved concession',
+        },
+      ],
+      lateFee: { mode: 'fixed_once', graceDays: 0, amountMinor: 5000, capMinor: 5000 },
+      installments: [{ dueDate: yesterday, amountMinor: 130000 }],
+      note: 'Synthetic flexible fee schedule',
+    },
+    {},
+    true,
+  );
+  assert.equal(created.r.status, 201, JSON.stringify(created.data));
+  assert.equal(
+    (
+      await call(
+        '/v1/admin/fees/schedules/' + created.data.id + '/activate',
+        'POST',
+        { expectedVersion: 1 },
+        {},
+        true,
+      )
+    ).r.status,
+    201,
+  );
+
+  await tick(db);
+  await tick(db);
+
+  const schedules = (await call('/v1/admin/fees/schedules', 'GET', undefined, {}, true)).data;
+  const schedule = schedules.find((s: any) => s.id === created.data.id);
+  assert.equal(schedule.scope_type, 'course');
+  assert.equal(schedule.scope_reference, 'qa_course');
+  assert.equal(Number(schedule.gross_amount_minor), 150000);
+  assert.equal(Number(schedule.concession_amount_minor), 20000);
+  assert.equal(schedule.components.length, 2);
+  assert.equal(schedule.concessions.length, 1);
+  assert.equal(schedule.late_fee.mode, 'fixed_once');
+
+  const assessments = await db.query('SELECT * FROM late_fee_assessments WHERE schedule_id=$1', [
+    created.data.id,
+  ]);
+  assert.equal(assessments.length, 1);
+  assert.equal(Number(assessments[0]!.amount_minor), 5000);
+
+  const analytics = await call('/v1/admin/fees/analytics', 'GET', undefined, {}, true);
+  assert.equal(analytics.r.status, 200);
+  assert.ok(
+    analytics.data.byScope.some(
+      (row: any) => row.scope_type === 'course' && row.scope_reference === 'qa_course',
+    ),
+  );
+
+  const waived = await call(
+    '/v1/admin/fees/late-fees/' + assessments[0]!.id + '/waive',
+    'POST',
+    { reason: 'Synthetic operator-approved waiver' },
+    {},
+    true,
+  );
+  assert.equal(waived.r.status, 201, JSON.stringify(waived.data));
+  assert.equal(waived.data.status, 'waived');
+  assert.equal(
+    (
+      await db.query(
+        "SELECT count(*)::int AS count FROM audit WHERE object_id=$1 AND action='fees.late_fee.waive'",
+        [assessments[0]!.id],
+      )
+    )[0]!.count,
+    1,
+  );
+});
+
+test('generic hosted checkout is unavailable in the fee and eNACH product', async () => {
+  const response = await call('/v1/payer/' + token() + '/checkout', 'POST', {}, {}, true);
+  assert.equal(response.r.status, 404);
+});
+
+test('recurring mandate setup and due-date autopay reconcile through verified callbacks', async () => {
+  let mandateCalls = 0;
+  let debitCalls = 0;
+  let providerReturnUrl = '';
+  let debitReference = '';
+  const mandateReference = 'mandate_' + randomUUID().replaceAll('-', '');
+
+  const providerServer = createHttpServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(Buffer.from(chunk));
+    const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : {};
+
+    if (req.url === '/mandates') {
+      mandateCalls++;
+      assert.equal(req.method, 'POST');
+      assert.equal(req.headers.authorization, 'Bearer synthetic-autopay-api-key-123456789');
+      providerReturnUrl = body.returnUrl;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          providerReference: mandateReference,
+          authorizationUrl:
+            'http://127.0.0.1:' + (providerServer.address() as any).port + '/authorize',
+          expiresAt: new Date(Date.now() + 15 * 60 * 1000).toISOString(),
+        }),
+      );
+      return;
+    }
+
+    if (req.url === '/debits') {
+      debitCalls++;
+      assert.equal(req.method, 'POST');
+      assert.equal(req.headers.authorization, 'Bearer synthetic-autopay-api-key-123456789');
+      assert.equal(body.mandateReference, mandateReference);
+      debitReference = 'debit_' + randomUUID().replaceAll('-', '');
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ providerReference: debitReference, status: 'accepted' }));
+      return;
+    }
+
+    res.writeHead(404).end();
+  });
+
+  await new Promise<void>((resolve) => providerServer.listen(0, '127.0.0.1', resolve));
+  const providerPort = (providerServer.address() as { port: number }).port;
+  const previous = {
+    autopayMode: process.env.AUTOPAY_PROVIDER_MODE,
+    mandateUrl: process.env.AUTOPAY_MANDATE_CREATE_URL,
+    debitUrl: process.env.AUTOPAY_DEBIT_CREATE_URL,
+    allowedHosts: process.env.AUTOPAY_ALLOWED_HOSTS,
+    apiKey: process.env.AUTOPAY_API_KEY,
+    timeout: process.env.AUTOPAY_TIMEOUT_MS,
+    maxAttempts: process.env.AUTOPAY_MAX_ATTEMPTS,
+    webhookMode: process.env.PAYMENT_PROVIDER_MODE,
+    providerName: process.env.PAYMENT_PROVIDER_NAME,
+    webhookSecret: process.env.PAYMENT_WEBHOOK_SECRET,
+  };
+  Object.assign(process.env, {
+    AUTOPAY_PROVIDER_MODE: 'mandate_api',
+    AUTOPAY_MANDATE_CREATE_URL: 'http://127.0.0.1:' + providerPort + '/mandates',
+    AUTOPAY_DEBIT_CREATE_URL: 'http://127.0.0.1:' + providerPort + '/debits',
+    AUTOPAY_ALLOWED_HOSTS: '127.0.0.1',
+    AUTOPAY_API_KEY: 'synthetic-autopay-api-key-123456789',
+    AUTOPAY_TIMEOUT_MS: '5000',
+    AUTOPAY_MAX_ATTEMPTS: '3',
+    PAYMENT_PROVIDER_MODE: 'signed_hmac',
+    PAYMENT_PROVIDER_NAME: 'qa_autopay_gateway',
+    PAYMENT_WEBHOOK_SECRET: 'autopay-webhook-secret-'.repeat(3),
+  });
+
+  const send = async (body: any) => {
+    const raw = JSON.stringify(body);
+    const timestamp = String(Math.floor(Date.now() / 1000));
+    const signature = createHmac('sha256', process.env.PAYMENT_WEBHOOK_SECRET!)
+      .update(timestamp)
+      .update('.')
+      .update(raw)
+      .digest('hex');
+    const r = await fetch(base + '/v1/provider/payments/webhook', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Payment-Timestamp': timestamp,
+        'X-Payment-Signature': signature,
+      },
+      body: raw,
+    });
+    return { r, data: await r.json() };
+  };
+
+  try {
+    const reference = 'autopay_' + randomUUID().slice(0, 8);
+    const payer = await call(
+      '/v1/admin/payers',
+      'POST',
+      {
+        accountReference: reference,
+        displayName: 'Synthetic AutoPay Parent',
+        email: 'autopay@example.invalid',
+        preferredChannel: 'email',
+        locale: 'en-IN',
+      },
+      {},
+      true,
+    );
+    assert.equal(payer.r.status, 201, JSON.stringify(payer.data));
+
+    const dueDate = new Date().toISOString().slice(0, 10);
+    const schedule = await call(
+      '/v1/admin/fees/schedules',
+      'POST',
+      {
+        accountReference: reference,
+        payerId: payer.data.id,
+        scopeType: 'student',
+        scopeReference: reference,
+        currency: 'INR',
+        components: [{ code: 'tuition', label: 'Tuition', amountMinor: 90000 }],
+        installments: [{ dueDate, amountMinor: 90000 }],
+        note: 'Synthetic recurring collection schedule',
+      },
+      {},
+      true,
+    );
+    assert.equal(schedule.r.status, 201, JSON.stringify(schedule.data));
+    assert.equal(
+      (
+        await call(
+          '/v1/admin/fees/schedules/' + schedule.data.id + '/activate',
+          'POST',
+          { expectedVersion: 1 },
+          {},
+          true,
+        )
+      ).r.status,
+      201,
+    );
+
+    const schedules = (await call('/v1/admin/fees/schedules', 'GET', undefined, {}, true)).data;
+    const active = schedules.find((row: any) => row.id === schedule.data.id);
+    const installmentId = active.installments[0].id;
+
+    const link = await call(
+      '/v1/admin/fees/schedules/' + schedule.data.id + '/payer-link',
+      'POST',
+      { expiresHours: 1 },
+      {},
+      true,
+    );
+    assert.equal(link.r.status, 201, JSON.stringify(link.data));
+    const payerToken = String(link.data.path).split('/').filter(Boolean).pop()!;
+
+    const setupBody = { rail: 'enach', idempotencyKey: randomUUID() };
+    const competingBody = { ...setupBody, idempotencyKey: randomUUID() };
+    const [first, second] = await Promise.all([
+      call('/v1/payer/' + payerToken + '/mandates', 'POST', setupBody),
+      call('/v1/payer/' + payerToken + '/mandates', 'POST', competingBody),
+    ]);
+    const winningBody = first.r.status === 201 ? setupBody : competingBody;
+    const created = [first, second].filter((result) => result.r.status === 201);
+    assert.equal(created.length, 1, JSON.stringify([first.data, second.data]));
+    assert.equal([first, second].filter((result) => result.r.status === 409).length, 1);
+    const setup = created[0]!;
+    assert.equal(setup.data.status, 'created');
+    assert.equal(mandateCalls, 1);
+
+    const setupRetry = await call('/v1/payer/' + payerToken + '/mandates', 'POST', winningBody);
+    assert.equal(setupRetry.r.status, 201, JSON.stringify(setupRetry.data));
+    assert.equal(setupRetry.data.setupId, setup.data.setupId);
+    assert.equal(mandateCalls, 1);
+
+    // An idempotency replay must not redirect a payer to a bank authorization
+    // link that has already expired, even when the provider returned it before.
+    await owner.query(
+      "UPDATE payment_mandate_setup_requests SET expires_at=now()-interval '1 minute' WHERE id=$1",
+      [setup.data.setupId],
+    );
+    const expiredReplay = await call('/v1/payer/' + payerToken + '/mandates', 'POST', winningBody);
+    assert.equal(expiredReplay.r.status, 409);
+    assert.equal(mandateCalls, 1);
+    // An expired URL does not prove bank rejection; a fresh idempotency key
+    // must not create another mandate while the earlier setup is unresolved.
+    const replacementAttempt = await call('/v1/payer/' + payerToken + '/mandates', 'POST', {
+      ...winningBody,
+      idempotencyKey: randomUUID(),
+    });
+    assert.equal(replacementAttempt.r.status, 409);
+    assert.equal(mandateCalls, 1);
+    await owner.query(
+      "UPDATE payment_mandate_setup_requests SET expires_at=now()+interval '15 minutes' WHERE id=$1",
+      [setup.data.setupId],
+    );
+
+    const competingSetup = await call('/v1/payer/' + payerToken + '/mandates', 'POST', {
+      ...setupBody,
+      idempotencyKey: randomUUID(),
+    });
+    assert.equal(competingSetup.r.status, 409);
+    assert.equal(mandateCalls, 1);
+
+    const mandateEvent = {
+      eventId: 'evt_' + randomUUID(),
+      type: 'mandate_status',
+      scheduleId: schedule.data.id,
+      rail: 'enach',
+      providerReference: mandateReference,
+      status: 'active',
+      occurredAt: new Date().toISOString(),
+    };
+    const activated = await send(mandateEvent);
+    assert.equal(activated.r.status, 202, JSON.stringify(activated.data));
+    assert.equal(activated.data.status, 'applied', JSON.stringify(activated.data));
+
+    const returnToken = new URL(providerReturnUrl).pathname.split('/').filter(Boolean).pop()!;
+    const returned = await call('/v1/mandate-return/' + returnToken);
+    assert.equal(returned.r.status, 200, JSON.stringify(returned.data));
+    assert.equal(returned.data.status, 'active');
+
+    const portal = await call('/v1/payer/' + payerToken);
+    assert.equal(portal.r.status, 200, JSON.stringify(portal.data));
+    assert.equal(portal.data.autopayProviderConnected, true);
+    assert.ok(portal.data.mandates.some((row: any) => row.status === 'active'));
+
+    await tick(db);
+    let attempts = await db.query(
+      'SELECT * FROM autopay_debit_attempts WHERE installment_id=$1 ORDER BY attempt_no',
+      [installmentId],
+    );
+    assert.equal(attempts.length, 1);
+    assert.equal(attempts[0]!.status, 'queued');
+
+    const awaitingBank = await call('/v1/payer/' + payerToken);
+    assert.equal(awaitingBank.r.status, 200, JSON.stringify(awaitingBank.data));
+    assert.ok(awaitingBank.data.pendingAutopayInstallments.includes(installmentId));
+
+    // Prevent a duplicate collection on the hosted-checkout rail while the
+    // approved mandate worker has an unresolved debit for this installment.
+    const priorCheckout = {
+      mode: process.env.PAYMENT_CHECKOUT_MODE,
+      url: process.env.PAYMENT_CHECKOUT_CREATE_URL,
+      hosts: process.env.PAYMENT_CHECKOUT_ALLOWED_HOSTS,
+      key: process.env.PAYMENT_CHECKOUT_API_KEY,
+    };
+    Object.assign(process.env, {
+      PAYMENT_CHECKOUT_MODE: 'redirect_api',
+      PAYMENT_CHECKOUT_CREATE_URL: 'http://127.0.0.1:' + providerPort + '/checkout',
+      PAYMENT_CHECKOUT_ALLOWED_HOSTS: '127.0.0.1',
+      PAYMENT_CHECKOUT_API_KEY: 'synthetic-checkout-key',
+    });
+    try {
+      const blockedCheckout = await call('/v1/payer/' + payerToken + '/checkout', 'POST', {
+        installmentId,
+        amountMinor: 90000,
+        idempotencyKey: randomUUID(),
+      });
+      assert.equal(blockedCheckout.r.status, 404, JSON.stringify(blockedCheckout.data));
+    } finally {
+      for (const [key, value] of Object.entries({
+        PAYMENT_CHECKOUT_MODE: priorCheckout.mode,
+        PAYMENT_CHECKOUT_CREATE_URL: priorCheckout.url,
+        PAYMENT_CHECKOUT_ALLOWED_HOSTS: priorCheckout.hosts,
+        PAYMENT_CHECKOUT_API_KEY: priorCheckout.key,
+      })) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+
+    await tick(db);
+    attempts = await db.query(
+      'SELECT * FROM autopay_debit_attempts WHERE installment_id=$1 ORDER BY attempt_no',
+      [installmentId],
+    );
+    assert.equal(debitCalls, 1);
+    assert.equal(attempts.length, 1);
+    assert.equal(attempts[0]!.status, 'submitted');
+    assert.equal(attempts[0]!.provider_reference, debitReference);
+
+    const paymentEvent = {
+      eventId: 'evt_' + randomUUID(),
+      type: 'payment_confirmed',
+      installmentId,
+      providerReference: debitReference,
+      amountMinor: 90000,
+      currency: 'INR',
+      occurredAt: new Date().toISOString(),
+    };
+    const confirmed = await send(paymentEvent);
+    assert.equal(confirmed.r.status, 202, JSON.stringify(confirmed.data));
+    assert.equal(confirmed.data.status, 'applied');
+
+    attempts = await db.query(
+      'SELECT * FROM autopay_debit_attempts WHERE installment_id=$1 ORDER BY attempt_no',
+      [installmentId],
+    );
+    assert.equal(attempts[0]!.status, 'confirmed');
+    assert.ok(attempts[0]!.completed_at);
+
+    const installment = (
+      await db.query('SELECT * FROM fee_installments WHERE id=$1', [installmentId])
+    )[0]!;
+    assert.equal(installment.status, 'paid');
+    assert.equal(Number(installment.paid_amount_minor), 90000);
+    const settledPortal = await call('/v1/payer/' + payerToken);
+    assert.equal(settledPortal.r.status, 200);
+    assert.ok(!settledPortal.data.pendingAutopayInstallments.includes(installmentId));
+
+    await tick(db);
+    assert.equal(
+      (
+        await db.query(
+          'SELECT count(*)::int AS count FROM autopay_debit_attempts WHERE installment_id=$1',
+          [installmentId],
+        )
+      )[0]!.count,
+      1,
+    );
+
+    const adminAttempts = await call('/v1/admin/fees/autopay-attempts', 'GET', undefined, {}, true);
+    assert.equal(adminAttempts.r.status, 200);
+    assert.ok(adminAttempts.data.some((row: any) => row.id === attempts[0]!.id));
+
+    // A second installment exercises a different order of events: the bank
+    // accepts the debit, the worker loses its HTTP response, and only the
+    // signed payment callback arrives with the original merchantAttemptId.
+    const interruptedSchedule = await call(
+      '/v1/admin/fees/schedules',
+      'POST',
+      {
+        accountReference: reference,
+        payerId: payer.data.id,
+        scopeType: 'student',
+        scopeReference: reference,
+        currency: 'INR',
+        components: [{ code: 'tuition', label: 'Tuition', amountMinor: 18000 }],
+        installments: [{ dueDate, amountMinor: 18000 }],
+        note: 'Synthetic signed early debit confirmation',
+      },
+      {},
+      true,
+    );
+    assert.equal(interruptedSchedule.r.status, 201, JSON.stringify(interruptedSchedule.data));
+    const interruptedActivation = await call(
+      '/v1/admin/fees/schedules/' + interruptedSchedule.data.id + '/activate',
+      'POST',
+      { expectedVersion: 1 },
+      {},
+      true,
+    );
+    assert.equal(interruptedActivation.r.status, 201, JSON.stringify(interruptedActivation.data));
+    const allSchedules = (await call('/v1/admin/fees/schedules', 'GET', undefined, {}, true)).data;
+    const interruptedInstallmentId = allSchedules.find(
+      (s: any) => s.id === interruptedSchedule.data.id,
+    ).installments[0].id;
+    const earlyMandateReference = 'mandate_early_' + randomUUID().replaceAll('-', '');
+    // A provider may sign a callback for an unregistered reference. HMAC
+    // authentication alone must not create a new bank mandate in our ledger.
+    const unknownMandate = await send({
+      eventId: 'evt_' + randomUUID(),
+      type: 'mandate_status',
+      scheduleId: interruptedSchedule.data.id,
+      rail: 'enach',
+      providerReference: earlyMandateReference,
+      status: 'active',
+      occurredAt: new Date().toISOString(),
+    });
+    assert.equal(unknownMandate.r.status, 202, JSON.stringify(unknownMandate.data));
+    assert.equal(unknownMandate.data.code, 'MANDATE_SETUP_NOT_FOUND');
+
+    // A legacy provider callback without merchantSetupId is still supported
+    // after the exact prior setup reference is persisted.
+    await owner.query(
+      `INSERT INTO payment_mandate_setup_requests(
+         schedule_id,payer_id,idempotency_key,provider,rail,return_token_hash,
+         provider_reference,status
+       ) VALUES($1,$2,$3,'qa_autopay_gateway','enach',$4,$5,'created')`,
+      [
+        interruptedSchedule.data.id,
+        payer.data.id,
+        randomUUID(),
+        randomUUID(),
+        earlyMandateReference,
+      ],
+    );
+    const newMandate = await send({
+      eventId: 'evt_' + randomUUID(),
+      type: 'mandate_status',
+      scheduleId: interruptedSchedule.data.id,
+      rail: 'enach',
+      providerReference: earlyMandateReference,
+      status: 'active',
+      occurredAt: new Date().toISOString(),
+    });
+    assert.equal(newMandate.data.status, 'applied', JSON.stringify(newMandate.data));
+    await tick(db);
+    const interruptedAttempts = await db.query(
+      'SELECT * FROM autopay_debit_attempts WHERE installment_id=$1',
+      [interruptedInstallmentId],
+    );
+    assert.equal(interruptedAttempts.length, 1);
+    const interrupted = interruptedAttempts[0]!;
+    assert.equal(interrupted.status, 'queued');
+    await owner.query(
+      `UPDATE autopay_debit_attempts
+       SET status='uncertain',failure_code='PROVIDER_SUBMIT_UNCERTAIN'
+       WHERE id=$1`,
+      [interrupted.id],
+    );
+    const earlyDebitReference = 'debit_early_' + randomUUID().replaceAll('-', '');
+    const earlyEvent = {
+      eventId: 'evt_' + randomUUID(),
+      type: 'payment_confirmed',
+      merchantAttemptId: interrupted.id,
+      installmentId: interruptedInstallmentId,
+      providerReference: earlyDebitReference,
+      amountMinor: 18000,
+      currency: 'INR',
+      occurredAt: new Date().toISOString(),
+    };
+    const badCorrelation = await send({
+      ...earlyEvent,
+      eventId: 'evt_' + randomUUID(),
+      merchantAttemptId: randomUUID(),
+    });
+    assert.equal(badCorrelation.data.status, 'failed');
+    assert.equal(badCorrelation.data.code, 'DEBIT_ATTEMPT_CORRELATION_MISMATCH');
+    const badAmount = await send({
+      ...earlyEvent,
+      eventId: 'evt_' + randomUUID(),
+      amountMinor: 17999,
+    });
+    assert.equal(badAmount.data.code, 'DEBIT_ATTEMPT_CORRELATION_MISMATCH');
+    const wrongInstallment = await send({
+      ...earlyEvent,
+      eventId: 'evt_' + randomUUID(),
+      merchantAttemptId: attempts[0]!.id,
+    });
+    assert.equal(wrongInstallment.data.code, 'DEBIT_ATTEMPT_CORRELATION_MISMATCH');
+    const wrongFailure = await send({
+      ...earlyEvent,
+      eventId: 'evt_' + randomUUID(),
+      type: 'payment_failed',
+      merchantAttemptId: attempts[0]!.id,
+      reasonCode: 'BANK_REJECTED',
+    });
+    assert.equal(wrongFailure.data.code, 'UNMATCHED_PAYMENT_FAILURE');
+    assert.equal(
+      (
+        await db.query(
+          'SELECT count(*)::int AS count FROM payment_records WHERE installment_id=$1',
+          [interruptedInstallmentId],
+        )
+      )[0]!.count,
+      0,
+    );
+    const recovered = await send(earlyEvent);
+    assert.equal(recovered.r.status, 202, JSON.stringify(recovered.data));
+    assert.equal(recovered.data.status, 'applied');
+    const replayedEarly = await send(earlyEvent);
+    assert.equal(replayedEarly.data.duplicate, true);
+    const recoveredAttempt = (
+      await db.query('SELECT status,provider_reference FROM autopay_debit_attempts WHERE id=$1', [
+        interrupted.id,
+      ])
+    )[0]!;
+    assert.equal(recoveredAttempt.status, 'confirmed');
+    assert.equal(recoveredAttempt.provider_reference, earlyDebitReference);
+    assert.equal(
+      (
+        await db.query(
+          'SELECT count(*)::int AS count FROM payment_records WHERE installment_id=$1',
+          [interruptedInstallmentId],
+        )
+      )[0]!.count,
+      1,
+    );
+    const staleFailure = await send({
+      ...earlyEvent,
+      eventId: 'evt_' + randomUUID(),
+      type: 'payment_failed',
+      reasonCode: 'BANK_REJECTED',
+    });
+    assert.equal(staleFailure.data.status, 'failed');
+    assert.equal(
+      (
+        await db.query('SELECT status FROM autopay_debit_attempts WHERE id=$1', [interrupted.id])
+      )[0]!.status,
+      'confirmed',
+    );
+    await tick(db);
+    assert.equal(debitCalls, 1, 'signed recovery must not send a second bank debit');
+  } finally {
+    for (const [key, value] of Object.entries({
+      AUTOPAY_PROVIDER_MODE: previous.autopayMode,
+      AUTOPAY_MANDATE_CREATE_URL: previous.mandateUrl,
+      AUTOPAY_DEBIT_CREATE_URL: previous.debitUrl,
+      AUTOPAY_ALLOWED_HOSTS: previous.allowedHosts,
+      AUTOPAY_API_KEY: previous.apiKey,
+      AUTOPAY_TIMEOUT_MS: previous.timeout,
+      AUTOPAY_MAX_ATTEMPTS: previous.maxAttempts,
+      PAYMENT_PROVIDER_MODE: previous.webhookMode,
+      PAYMENT_PROVIDER_NAME: previous.providerName,
+      PAYMENT_WEBHOOK_SECRET: previous.webhookSecret,
+    })) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await new Promise<void>((resolve) => providerServer.close(() => resolve()));
+  }
+});
+
+test('signed eNACH status correlates an uncertain registration without a second mandate', async () => {
+  const previous = {
+    mode: process.env.PAYMENT_PROVIDER_MODE,
+    name: process.env.PAYMENT_PROVIDER_NAME,
+    secret: process.env.PAYMENT_WEBHOOK_SECRET,
+  };
+  Object.assign(process.env, {
+    PAYMENT_PROVIDER_MODE: 'signed_hmac',
+    PAYMENT_PROVIDER_NAME: 'qa_enach_gateway',
+    PAYMENT_WEBHOOK_SECRET: 'enach-test-webhook-secret-'.repeat(3),
+  });
+  const sendSigned = async (body: Record<string, unknown>) => {
+    const raw = JSON.stringify(body);
+    const timestamp = String(Math.floor(Date.now() / 1000));
+    const signature = createHmac('sha256', process.env.PAYMENT_WEBHOOK_SECRET!)
+      .update(timestamp)
+      .update('.')
+      .update(raw)
+      .digest('hex');
+    return call('/v1/provider/payments/webhook', 'POST', body, {
+      'X-Payment-Timestamp': timestamp,
+      'X-Payment-Signature': signature,
+    });
+  };
+  try {
+    const ref = 'enach_unknown_' + randomUUID().slice(0, 8);
+    const payer = await call(
+      '/v1/admin/payers',
+      'POST',
+      {
+        accountReference: ref,
+        displayName: 'Synthetic eNACH Reconciliation Payer',
+        email: 'enach-reconcile@example.invalid',
+        preferredChannel: 'email',
+        locale: 'en-IN',
+      },
+      {},
+      true,
+    );
+    assert.equal(payer.r.status, 201, JSON.stringify(payer.data));
+    const schedule = await call(
+      '/v1/admin/fees/schedules',
+      'POST',
+      {
+        accountReference: ref,
+        payerId: payer.data.id,
+        scopeType: 'student',
+        scopeReference: ref,
+        currency: 'INR',
+        components: [{ code: 'tuition', label: 'Tuition', amountMinor: 50000 }],
+        installments: [
+          {
+            dueDate: new Date(Date.now() + 86_400_000).toISOString().slice(0, 10),
+            amountMinor: 50000,
+          },
+        ],
+        note: 'Unknown registration correlation regression',
+      },
+      {},
+      true,
+    );
+    assert.equal(schedule.r.status, 201, JSON.stringify(schedule.data));
+    const setupId = randomUUID();
+    await owner.query(
+      `INSERT INTO payment_mandate_setup_requests(
+        id,schedule_id,payer_id,idempotency_key,provider,rail,return_token_hash,
+        status,failure_code
+      ) VALUES($1,$2,$3,$4,'qa_enach_gateway','enach',$5,'uncertain','PROVIDER_CREATE_UNCERTAIN')`,
+      [setupId, schedule.data.id, payer.data.id, randomUUID(), randomUUID()],
+    );
+    const investigator = (
+      await owner.query(
+        `SELECT user_id FROM memberships WHERE tenant_id=$1 AND role_key='owner'
+         AND status='active' LIMIT 1`,
+        [primaryTenantId],
+      )
+    ).rows[0];
+    assert.ok(investigator);
+    const caseId = randomUUID();
+    await owner.query(
+      `INSERT INTO mandate_reconciliation_cases(
+        id,tenant_id,setup_id,provider_case_reference,evidence_summary,created_by
+      ) VALUES($1,$2,$3,$4,'provider_inquiry_opened',$5)`,
+      [
+        caseId,
+        primaryTenantId,
+        setupId,
+        'QA-CASE-' + randomUUID().slice(0, 8),
+        investigator.user_id,
+      ],
+    );
+    // Existing admin endpoint derives review readiness and age from the same
+    // immutable case/evidence ledger, never from a manually edited status.
+    const awaitingEvidence = await call(
+      '/v1/admin/fees/mandate-reconciliation-cases',
+      'GET',
+      undefined,
+      {},
+      true,
+    );
+    assert.equal(awaitingEvidence.r.status, 200, JSON.stringify(awaitingEvidence.data));
+    const queuedCase = awaitingEvidence.data.find((entry: any) => entry.id === caseId);
+    assert.ok(queuedCase);
+    assert.equal(queuedCase.queue_state, 'awaiting_provider_evidence');
+    assert.equal(queuedCase.evidence_count, 0);
+    assert.equal(queuedCase.pending_review_count, 0);
+    assert.ok(Number(queuedCase.age_hours) >= 0);
+
+    const evidenceSubmission = await call(
+      '/v1/admin/fees/mandate-reconciliation-cases/' + caseId + '/evidence',
+      'POST',
+      {
+        providerEvidenceReference: 'QA-TRACE-' + randomUUID().slice(0, 8),
+        finding: 'provider_inquiry_pending',
+      },
+      {},
+      true,
+    );
+    assert.equal(evidenceSubmission.r.status, 201, JSON.stringify(evidenceSubmission.data));
+    const reviewQueue = await call(
+      '/v1/admin/fees/mandate-reconciliation-cases',
+      'GET',
+      undefined,
+      {},
+      true,
+    );
+    assert.equal(reviewQueue.r.status, 200, JSON.stringify(reviewQueue.data));
+    const pendingReview = reviewQueue.data.find((entry: any) => entry.id === caseId);
+    assert.equal(pendingReview.queue_state, 'awaiting_independent_review');
+    assert.equal(pendingReview.evidence_count, 1);
+    assert.equal(pendingReview.pending_review_count, 1);
+
+    const reference = 'enach_' + randomUUID().replaceAll('-', '');
+    const event = {
+      eventId: 'evt_' + randomUUID(),
+      type: 'mandate_status',
+      merchantSetupId: setupId,
+      scheduleId: schedule.data.id,
+      rail: 'enach',
+      providerReference: reference,
+      status: 'active',
+      occurredAt: new Date().toISOString(),
+    };
+
+    // Even a valid HMAC does not establish which uncertain registration was
+    // accepted unless the original merchant setup ID can be correlated.
+    const uncorrelatedEvent = await sendSigned({
+      eventId: 'evt_' + randomUUID(),
+      type: 'mandate_status',
+      scheduleId: schedule.data.id,
+      rail: 'enach',
+      providerReference: reference,
+      status: 'active',
+      occurredAt: new Date().toISOString(),
+    });
+    assert.equal(uncorrelatedEvent.r.status, 202, JSON.stringify(uncorrelatedEvent.data));
+    assert.equal(uncorrelatedEvent.data.code, 'MANDATE_SETUP_CORRELATION_REQUIRED');
+    const uncorrelatedMandates = (
+      await owner.query(
+        'SELECT count(*)::int AS count FROM payment_mandates WHERE schedule_id=$1',
+        [schedule.data.id],
+      )
+    ).rows[0];
+    assert.equal(uncorrelatedMandates.count, 0);
+
+    // A different mandate rail must not bypass a still-uncertain registration
+    // on the same schedule by omitting merchantSetupId.
+    const crossRail = await sendSigned({
+      eventId: 'evt_' + randomUUID(),
+      type: 'mandate_status',
+      scheduleId: schedule.data.id,
+      rail: 'enach',
+      providerReference: 'upi_' + randomUUID().replaceAll('-', ''),
+      status: 'active',
+      occurredAt: new Date().toISOString(),
+    });
+    assert.equal(crossRail.r.status, 202, JSON.stringify(crossRail.data));
+    assert.equal(crossRail.data.code, 'MANDATE_SETUP_CORRELATION_REQUIRED');
+
+    const mismatchedEventId = 'evt_' + randomUUID();
+    const invalid = await sendSigned({
+      ...event,
+      eventId: mismatchedEventId,
+      merchantSetupId: randomUUID(),
+    });
+    assert.equal(invalid.r.status, 202, JSON.stringify(invalid.data));
+    assert.equal(invalid.data.code, 'MANDATE_SETUP_CORRELATION_MISMATCH');
+    const before = (
+      await owner.query(
+        'SELECT status,provider_reference FROM payment_mandate_setup_requests WHERE id=$1',
+        [setupId],
+      )
+    ).rows[0];
+    assert.equal(before.status, 'uncertain');
+    assert.equal(before.provider_reference, null);
+    const unresolvedCase = (
+      await owner.query(
+        'SELECT status,resolution_provider_event_id FROM mandate_reconciliation_cases WHERE id=$1',
+        [caseId],
+      )
+    ).rows[0];
+    assert.equal(unresolvedCase.status, 'open');
+    assert.equal(unresolvedCase.resolution_provider_event_id, null);
+
+    // A failed/mismatched provider event is not resolution evidence, even if
+    // somebody tries to write directly to the investigation table.
+    const rejectedEvent = (
+      await owner.query(
+        `SELECT id FROM payment_provider_events
+         WHERE tenant_id=$1 AND provider_event_id=$2 AND status='failed'`,
+        [primaryTenantId, mismatchedEventId],
+      )
+    ).rows[0];
+    assert.ok(rejectedEvent);
+    await assert.rejects(
+      owner.query(
+        `UPDATE mandate_reconciliation_cases
+         SET status='resolved_signed',resolved_at=now(),resolution_provider_event_id=$2
+         WHERE id=$1`,
+        [caseId, rejectedEvent.id],
+      ),
+      /correlated applied terminal provider event/i,
+    );
+
+    const valid = await sendSigned(event);
+    assert.equal(valid.r.status, 202, JSON.stringify(valid.data));
+    assert.equal(valid.data.status, 'applied');
+    const setup = (
+      await owner.query(
+        'SELECT status,provider_reference FROM payment_mandate_setup_requests WHERE id=$1',
+        [setupId],
+      )
+    ).rows[0];
+    assert.equal(setup.status, 'active');
+    assert.equal(setup.provider_reference, reference);
+    const resolvedCase = (
+      await owner.query(
+        'SELECT status,resolved_at,resolution_provider_event_id FROM mandate_reconciliation_cases WHERE id=$1',
+        [caseId],
+      )
+    ).rows[0];
+    assert.equal(resolvedCase.status, 'resolved_signed');
+    assert.ok(resolvedCase.resolved_at);
+    assert.ok(resolvedCase.resolution_provider_event_id);
+    const completedQueue = await call(
+      '/v1/admin/fees/mandate-reconciliation-cases',
+      'GET',
+      undefined,
+      {},
+      true,
+    );
+    assert.equal(completedQueue.r.status, 200, JSON.stringify(completedQueue.data));
+    assert.equal(
+      completedQueue.data.find((entry: any) => entry.id === caseId)?.queue_state,
+      'resolved_signed',
+    );
+    await assert.rejects(
+      owner.query(
+        `UPDATE mandate_reconciliation_cases
+         SET provider_case_reference='TAMPERED' WHERE id=$1`,
+        [caseId],
+      ),
+      /immutable except signed final resolution/i,
+    );
+    await assert.rejects(
+      owner.query('DELETE FROM mandate_reconciliation_cases WHERE id=$1', [caseId]),
+      /cannot be deleted/i,
+    );
+    const mandates = (
+      await owner.query(
+        'SELECT status,rail FROM payment_mandates WHERE schedule_id=$1 AND provider_reference=$2',
+        [schedule.data.id, reference],
+      )
+    ).rows;
+    assert.equal(mandates.length, 1);
+    assert.equal(mandates[0].status, 'active');
+    assert.equal(mandates[0].rail, 'enach');
+
+    // A different, HMAC-valid provider reference must not create another
+    // active mandate for this fee schedule after the first registration.
+    const conflictingReference = 'enach_conflict_' + randomUUID().replaceAll('-', '');
+    const conflicting = await sendSigned({
+      ...event,
+      eventId: 'evt_' + randomUUID(),
+      providerReference: conflictingReference,
+      merchantSetupId: undefined,
+      occurredAt: new Date(Date.now() + 1000).toISOString(),
+    });
+    assert.equal(conflicting.r.status, 202, JSON.stringify(conflicting.data));
+    assert.equal(conflicting.data.code, 'ACTIVE_MANDATE_REFERENCE_CONFLICT');
+    const secondMandateCount = (
+      await owner.query(
+        'SELECT count(*)::int AS count FROM payment_mandates WHERE schedule_id=$1',
+        [schedule.data.id],
+      )
+    ).rows[0];
+    assert.equal(secondMandateCount.count, 1);
+
+    // A direct SQL writer cannot bypass the cross-rail active-mandate rule.
+    await assert.rejects(
+      owner.query(
+        `INSERT INTO payment_mandates(
+           schedule_id,rail,provider,provider_reference,status,recorded_by,recorded_via
+         ) VALUES($1,'enach','qa_enach_gateway',$2,'active',NULL,'provider')`,
+        [schedule.data.id, 'db-duplicate-' + randomUUID()],
+      ),
+      /duplicate key|unique constraint/i,
+    );
+
+    const replay = await sendSigned(event);
+    assert.equal(replay.r.status, 202);
+    assert.equal(replay.data.duplicate, true);
+    const afterReplayCase = (
+      await owner.query(
+        'SELECT resolution_provider_event_id FROM mandate_reconciliation_cases WHERE id=$1',
+        [caseId],
+      )
+    ).rows[0];
+    assert.equal(
+      afterReplayCase.resolution_provider_event_id,
+      resolvedCase.resolution_provider_event_id,
+    );
+    const count = (
+      await owner.query(
+        'SELECT count(*)::int AS count FROM payment_mandates WHERE schedule_id=$1 AND provider_reference=$2',
+        [schedule.data.id, reference],
+      )
+    ).rows[0];
+    assert.equal(count.count, 1);
+  } finally {
+    for (const [key, value] of Object.entries({
+      PAYMENT_PROVIDER_MODE: previous.mode,
+      PAYMENT_PROVIDER_NAME: previous.name,
+      PAYMENT_WEBHOOK_SECRET: previous.secret,
+    })) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test('session revocation invalidates subsequent access', async () => {
+  await call('/v1/auth/logout', 'POST', {}, {}, true);
+  assert.equal((await call('/v1/admin/content', 'GET', undefined, {}, true)).r.status, 401);
+});
+
+test('account-wide self-revocation logs out every workspace session, including a restricted tenant', async () => {
+  const user = (
+    await owner.query('SELECT id FROM users WHERE lower(email)=lower($1)', [
+      process.env.OWNER_EMAIL,
+    ])
+  ).rows[0]!;
+  const makeSession = async (tenantId: string) => {
+    const raw = token();
+    const csrfToken = keyed('csrf:' + raw);
+    await owner.query(
+      `INSERT INTO sessions(user_id,tenant_id,token_hash,csrf_hash,expires_at)
+       VALUES($1,$2,$3,$4,now()+interval '8 hours')`,
+      [user.id, tenantId, digest(raw), digest(csrfToken)],
+    );
+    return { raw, csrf: csrfToken };
+  };
+  const restricted = await makeSession(secondaryTenantId);
+  const active = await makeSession(primaryTenantId);
+  await owner.query("UPDATE tenants SET status='restricted' WHERE id=$1", [secondaryTenantId]);
+  cookie = 'jodo_session=' + restricted.raw;
+  csrf = restricted.csrf;
+
+  assert.equal((await call('/v1/auth/me', 'GET', undefined, {}, true)).r.status, 200);
+  const activeBefore = await fetch(base + '/v1/auth/me', {
+    headers: { Cookie: 'jodo_session=' + active.raw },
+  });
+  assert.equal(activeBefore.status, 200);
+
+  const result = await call('/v1/auth/logout-all', 'POST', {}, {}, true);
+  assert.equal(result.r.status, 201, JSON.stringify(result.data));
+  assert.equal(result.data.status, 'signed_out_everywhere');
+  assert.ok(result.data.revokedSessions >= 2);
+  assert.equal((await call('/v1/auth/me', 'GET', undefined, {}, true)).r.status, 401);
+  const activeAfter = await fetch(base + '/v1/auth/me', {
+    headers: { Cookie: 'jodo_session=' + active.raw },
+  });
+  assert.equal(activeAfter.status, 401);
+  const remaining = (
+    await owner.query(
+      'SELECT count(*)::int AS count FROM sessions WHERE user_id=$1 AND revoked_at IS NULL',
+      [user.id],
+    )
+  ).rows[0]!;
+  assert.equal(remaining.count, 0);
+  const audit = (
+    await owner.query(
+      "SELECT id FROM audit WHERE action='auth.sessions.revoke_all' AND object_id=$1 ORDER BY id DESC LIMIT 1",
+      [user.id],
+    )
+  ).rows[0];
+  assert.ok(audit);
+});

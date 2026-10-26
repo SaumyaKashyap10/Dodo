@@ -1,0 +1,960 @@
+import { receiptContact } from './receipt-contact';
+import {
+  Body,
+  Controller,
+  ForbiddenException,
+  Get,
+  Headers,
+  HttpCode,
+  Inject,
+  Post,
+  Req,
+  ServiceUnavailableException,
+  UseGuards,
+} from '@nestjs/common';
+import { createHash, createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
+import { Request } from 'express';
+import { z } from 'zod';
+import { Db } from './db';
+import { syncQueuedDebitBalances } from './fee-balances';
+import { AuthGuard, AuthedRequest, Roles } from './auth';
+import { paymentProviderEventSchema } from '../../../packages/core/src/contracts';
+import { isNewerMandateEvent } from '../../../packages/core/src/mandate-events';
+import { hasMatchedPaymentFailure } from '../../../packages/core/src/payment-failure';
+import { decrypt } from '../../../packages/core/src/security';
+
+function safeEqualHex(a: string, b: string) {
+  if (!/^[a-f0-9]{64}$/i.test(a) || !/^[a-f0-9]{64}$/i.test(b)) return false;
+  const aa = Buffer.from(a, 'hex');
+  const bb = Buffer.from(b, 'hex');
+  return aa.length === bb.length && timingSafeEqual(aa, bb);
+}
+
+@Controller('v1/provider/payments')
+export class PaymentProviderController {
+  constructor(@Inject(Db) private db: Db) {}
+
+  @Get('status')
+  status() {
+    const sandbox = process.env.AUTOPAY_PROVIDER_MODE === 'sandbox';
+    const webhookEnabled = process.env.PAYMENT_PROVIDER_MODE === 'signed_hmac';
+    const checkoutEnabled = process.env.PAYMENT_CHECKOUT_MODE === 'redirect_api';
+    const autopayEnabled = process.env.AUTOPAY_PROVIDER_MODE === 'mandate_api';
+    return {
+      provider: sandbox
+        ? 'sandbox_enach'
+        : webhookEnabled || checkoutEnabled || autopayEnabled
+          ? process.env.PAYMENT_PROVIDER_NAME
+          : null,
+      sandboxSimulationAllowed: sandbox && process.env.DEPLOYMENT_MODE !== 'production',
+      webhookMode: webhookEnabled ? 'signed_hmac' : 'disabled',
+      checkoutMode: checkoutEnabled ? 'redirect_api' : 'disabled',
+      autopayMode: sandbox ? 'sandbox' : autopayEnabled ? 'mandate_api' : 'disabled',
+      reconciliationMode:
+        process.env.AUTOPAY_RECONCILE_MODE === 'read_only' ? 'read_only' : 'disabled',
+      moneyMovement: checkoutEnabled || autopayEnabled,
+      note:
+        checkoutEnabled || autopayEnabled
+          ? 'Hosted payment capabilities are configured. Payment credentials remain with the selected provider; authoritative outcomes arrive through verified provider callbacks.'
+          : 'Signed provider callbacks can be enabled independently. Hosted checkout and recurring mandate APIs remain disabled until approved provider endpoints are configured.',
+    };
+  }
+
+  @Post('webhook')
+  @HttpCode(202)
+  async webhook(
+    @Req() req: Request & { rawBody?: Buffer },
+    @Body() body: unknown,
+    @Headers('x-payment-signature') signature?: string,
+    @Headers('x-payment-timestamp') timestamp?: string,
+  ) {
+    if (process.env.PAYMENT_PROVIDER_MODE !== 'signed_hmac')
+      throw new ServiceUnavailableException('Payment provider webhook is not activated');
+
+    const provider = process.env.PAYMENT_PROVIDER_NAME!;
+    const raw = req.rawBody;
+    if (!raw?.length) throw new ForbiddenException('Raw signed payload is unavailable');
+
+    const ts = Number(timestamp);
+    const tolerance = Number(process.env.PAYMENT_WEBHOOK_TOLERANCE_SECONDS || 300);
+    if (!Number.isInteger(ts) || Math.abs(Date.now() / 1000 - ts) > tolerance)
+      throw new ForbiddenException('Webhook timestamp is outside the accepted window');
+
+    // During an approved secret rotation, accept either the primary key or
+    // the explicitly configured previous key. Never accept arbitrary secrets
+    // supplied by a webhook or include key material in logs/response bodies.
+    const expiresAt = process.env.PAYMENT_WEBHOOK_PREVIOUS_SECRET_EXPIRES_AT;
+    const previousValid =
+      Boolean(expiresAt) &&
+      Number.isFinite(Date.parse(expiresAt!)) &&
+      Date.now() < Date.parse(expiresAt!);
+    const secrets = [
+      process.env.PAYMENT_WEBHOOK_SECRET,
+      previousValid ? process.env.PAYMENT_WEBHOOK_PREVIOUS_SECRET : undefined,
+    ].filter((value): value is string => Boolean(value));
+    const supplied = (signature || '').replace(/^sha256=/i, '');
+    let verified = false;
+    for (const secret of secrets) {
+      const expected = createHmac('sha256', secret)
+        .update(String(ts))
+        .update('.')
+        .update(raw)
+        .digest('hex');
+      verified = safeEqualHex(expected, supplied) || verified;
+    }
+    if (!verified) throw new ForbiddenException('Webhook signature is invalid');
+
+    const event = paymentProviderEventSchema.parse(body);
+    const bodyHash = createHash('sha256').update(raw).digest('hex');
+
+    return this.applyVerifiedEvent(provider, event, bodyHash);
+  }
+
+  // Internal provider boundary. HTTP callers must pass through signature verification.
+  // Sandbox supplies tenant ownership explicitly and uses the same ledger/receipt logic.
+  async applyVerifiedEvent(
+    provider: string,
+    event: z.infer<typeof paymentProviderEventSchema>,
+    bodyHash: string,
+    expectedTenantId?: string,
+  ) {
+    let capturedTenantId = expectedTenantId || '';
+    const txResult: any = await this.db.tx(async (c) => {
+      const tenant =
+        event.type === 'mandate_status'
+          ? (await c.query('SELECT tenant_id FROM fee_schedules WHERE id=$1', [event.scheduleId]))
+              .rows[0]
+          : (
+              await c.query(
+                `SELECT s.tenant_id
+                 FROM fee_installments i
+                 JOIN fee_schedules s ON s.id=i.schedule_id
+                 WHERE i.id=$1`,
+                [event.installmentId],
+              )
+            ).rows[0];
+      if (!tenant)
+        throw new ForbiddenException('Provider event references an unknown financial record');
+      const tenantId = tenant.tenant_id;
+      capturedTenantId = tenantId;
+      if (expectedTenantId && tenantId !== expectedTenantId)
+        throw new ForbiddenException('Provider tenant mismatch');
+
+      const inserted = (
+        await c.query(
+          `INSERT INTO payment_provider_events(
+             tenant_id,provider,provider_event_id,event_type,body_hash,normalized_payload
+           ) VALUES($1,$2,$3,$4,$5,$6)
+           ON CONFLICT(tenant_id,provider,provider_event_id) DO NOTHING
+           RETURNING *`,
+          [tenantId, provider, event.eventId, event.type, bodyHash, event],
+        )
+      ).rows[0];
+
+      if (!inserted) {
+        const existing = (
+          await c.query(
+            `SELECT id,status,failure_code,body_hash FROM payment_provider_events
+             WHERE tenant_id=$1 AND provider=$2 AND provider_event_id=$3`,
+            [tenantId, provider, event.eventId],
+          )
+        ).rows[0];
+        if (existing?.body_hash !== bodyHash)
+          throw new ForbiddenException('Provider event ID was reused with different content');
+        return { accepted: true, duplicate: true, status: existing?.status || 'received' };
+      }
+
+      if (event.type === 'payment_failed') {
+        // A merchantAttemptId explicitly denotes a recurring debit rather
+        // than a one-time checkout. Never mutate a checkout using its callback.
+        const checkoutFailure = event.merchantAttemptId
+          ? { rowCount: 0 }
+          : await c.query(
+              `UPDATE payment_checkout_sessions
+           SET status='failed',failure_code=$4,updated_at=now()
+           WHERE tenant_id=$1 AND provider=$2 AND provider_reference=$3
+             AND installment_id=$5 AND amount_minor=$6 AND currency=$7
+             AND status IN('requested','created','uncertain')`,
+              [
+                tenantId,
+                provider,
+                event.providerReference,
+                event.reasonCode,
+                event.installmentId,
+                event.amountMinor,
+                event.currency,
+              ],
+            );
+        const debitFailure = await c.query(
+          `UPDATE autopay_debit_attempts a
+           SET provider_reference=coalesce(a.provider_reference,$3),
+               status='failed',failure_code=$4,
+               next_retry_at=CASE
+                 WHEN a.attempt_no < greatest(1,least(10,$5::int))
+                   THEN now() + CASE
+                     WHEN a.attempt_no=1 THEN interval '1 hour'
+                     WHEN a.attempt_no=2 THEN interval '24 hours'
+                     ELSE interval '48 hours'
+                   END
+                 ELSE NULL
+               END,
+               updated_at=now()
+           WHERE a.tenant_id=$1 AND a.provider=$2
+             AND a.installment_id=$6 AND a.amount_minor=$7 AND a.currency=$8
+             AND a.status IN('submitted','queued','uncertain')
+             AND (
+               ($9::uuid IS NULL AND a.provider_reference=$3)
+               OR ($9::uuid IS NOT NULL AND a.id=$9
+                   AND a.status IN('submitted','uncertain')
+                   AND (a.provider_reference IS NULL OR a.provider_reference=$3)
+                   AND NOT EXISTS (
+                     SELECT 1 FROM autopay_debit_attempts rival
+                     WHERE rival.tenant_id=$1 AND rival.provider=$2
+                       AND rival.provider_reference=$3 AND rival.id<>a.id
+                   ))
+             )`,
+          [
+            tenantId,
+            provider,
+            event.providerReference,
+            event.reasonCode,
+            Number(process.env.AUTOPAY_MAX_ATTEMPTS || 3),
+            event.installmentId,
+            event.amountMinor,
+            event.currency,
+            event.merchantAttemptId || null,
+          ],
+        );
+        // A signed event is not necessarily a valid transaction outcome.
+        // Only apply a failure if it changed the exact outstanding checkout
+        // or debit attempt; otherwise keep the discrepancy for investigation.
+        if (!hasMatchedPaymentFailure(checkoutFailure.rowCount, debitFailure.rowCount)) {
+          await c.query(
+            `UPDATE payment_provider_events
+             SET status='failed',failure_code='UNMATCHED_PAYMENT_FAILURE'
+             WHERE id=$1`,
+            [inserted.id],
+          );
+          await this.db.audit(
+            c,
+            'provider:' + provider,
+            'payment.provider_unmatched_failure',
+            inserted.id,
+            {
+              providerEventId: event.eventId,
+              providerReference: event.providerReference,
+              installmentId: event.installmentId,
+            },
+          );
+          return {
+            accepted: false,
+            duplicate: false,
+            status: 'failed',
+            code: 'UNMATCHED_PAYMENT_FAILURE',
+          };
+        }
+        await c.query(
+          `UPDATE payment_provider_events
+           SET status='applied',applied_at=now()
+           WHERE id=$1`,
+          [inserted.id],
+        );
+        await this.db.audit(c, 'provider:' + provider, 'payment.provider_failed', inserted.id, {
+          providerEventId: event.eventId,
+          providerReference: event.providerReference,
+          installmentId: event.installmentId,
+          amountMinor: event.amountMinor,
+          currency: event.currency,
+          reasonCode: event.reasonCode,
+          occurredAt: event.occurredAt,
+        });
+        return { accepted: true, duplicate: false, status: 'applied' };
+      }
+
+      if (event.type === 'mandate_status') {
+        const schedule = (
+          await c.query('SELECT id FROM fee_schedules WHERE id=$1 AND tenant_id=$2 FOR UPDATE', [
+            event.scheduleId,
+            tenantId,
+          ])
+        ).rows[0];
+        if (!schedule) {
+          await c.query(
+            `UPDATE payment_provider_events
+             SET status='failed',failure_code='UNKNOWN_SCHEDULE'
+             WHERE id=$1`,
+            [inserted.id],
+          );
+          return { accepted: false, duplicate: false, status: 'failed', code: 'UNKNOWN_SCHEDULE' };
+        }
+
+        const existingMandate = (
+          await c.query(
+            `SELECT * FROM payment_mandates
+             WHERE tenant_id=$1 AND provider=$2 AND provider_reference=$3
+             FOR UPDATE`,
+            [tenantId, provider, event.providerReference],
+          )
+        ).rows[0];
+
+        if (
+          existingMandate &&
+          (existingMandate.schedule_id !== event.scheduleId || existingMandate.rail !== event.rail)
+        ) {
+          await c.query(
+            `UPDATE payment_provider_events
+             SET status='failed',failure_code='MANDATE_REFERENCE_MISMATCH'
+             WHERE id=$1`,
+            [inserted.id],
+          );
+          return {
+            accepted: false,
+            duplicate: false,
+            status: 'failed',
+            code: 'MANDATE_REFERENCE_MISMATCH',
+          };
+        }
+
+        // A verified signature authenticates the sender, not permission to
+        // register an additional mandate. Never create a second mandate with
+        // another provider reference while this fee schedule is already active.
+        // Migration 032 independently enforces one active mandate per schedule
+        // if a future writer bypasses this callback-level rejection.
+        if (!existingMandate) {
+          const conflictingActiveMandate = (
+            await c.query(
+              `SELECT id FROM payment_mandates
+               WHERE tenant_id=$1 AND schedule_id=$2 AND status='active'
+                 AND (provider<>$3 OR provider_reference<>$4)
+               LIMIT 1 FOR UPDATE`,
+              [tenantId, event.scheduleId, provider, event.providerReference],
+            )
+          ).rows[0];
+          if (conflictingActiveMandate) {
+            await c.query(
+              `UPDATE payment_provider_events
+               SET status='failed',failure_code='ACTIVE_MANDATE_REFERENCE_CONFLICT'
+               WHERE id=$1`,
+              [inserted.id],
+            );
+            await this.db.audit(
+              c,
+              'provider:' + provider,
+              'fees.mandate.conflicting_active_reference_rejected',
+              conflictingActiveMandate.id,
+              { providerEventId: event.eventId, scheduleId: event.scheduleId },
+            );
+            return {
+              accepted: false,
+              duplicate: false,
+              status: 'failed',
+              code: 'ACTIVE_MANDATE_REFERENCE_CONFLICT',
+            };
+          }
+        }
+
+        // For a first mandate, a signature alone does not establish that our
+        // platform requested the registration. Legacy callbacks may omit
+        // merchantSetupId only when the exact provider reference was already
+        // persisted on a prior, tenant-scoped setup request. Unknown or
+        // uncertain registration outcomes must never authorize a new mandate.
+        if (!existingMandate && !event.merchantSetupId) {
+          const uncertain = (
+            await c.query(
+              `SELECT id FROM payment_mandate_setup_requests
+               WHERE tenant_id=$1 AND schedule_id=$2
+                 AND status='uncertain'
+               LIMIT 1`,
+              [tenantId, event.scheduleId],
+            )
+          ).rows[0];
+          const matchingSetup = uncertain
+            ? null
+            : (
+                await c.query(
+                  `SELECT id FROM payment_mandate_setup_requests
+                   WHERE tenant_id=$1 AND schedule_id=$2 AND rail=$3
+                     AND provider=$4 AND provider_reference=$5
+                     AND status IN('created','active')
+                   LIMIT 1`,
+                  [tenantId, event.scheduleId, event.rail, provider, event.providerReference],
+                )
+              ).rows[0];
+          if (!matchingSetup) {
+            const code = uncertain
+              ? 'MANDATE_SETUP_CORRELATION_REQUIRED'
+              : 'MANDATE_SETUP_NOT_FOUND';
+            await c.query(
+              `UPDATE payment_provider_events
+               SET status='failed',failure_code=$2
+               WHERE id=$1`,
+              [inserted.id, code],
+            );
+            await this.db.audit(
+              c,
+              'provider:' + provider,
+              'fees.mandate.uncorrelated_status_rejected',
+              uncertain?.id || inserted.id,
+              { providerEventId: event.eventId, scheduleId: event.scheduleId, code },
+            );
+            return { accepted: false, duplicate: false, status: 'failed', code };
+          }
+        }
+
+        if (
+          existingMandate &&
+          !isNewerMandateEvent(event.occurredAt, existingMandate.last_event_at)
+        ) {
+          await c.query(
+            `UPDATE payment_provider_events
+             SET status='ignored',failure_code='STALE_MANDATE_STATUS',applied_at=now()
+             WHERE id=$1`,
+            [inserted.id],
+          );
+          await this.db.audit(
+            c,
+            'provider:' + provider,
+            'fees.mandate.stale_status_ignored',
+            existingMandate.id,
+            {
+              providerEventId: event.eventId,
+              incomingOccurredAt: event.occurredAt,
+            },
+          );
+          return {
+            accepted: true,
+            duplicate: false,
+            status: 'ignored',
+            code: 'STALE_MANDATE_STATUS',
+          };
+        }
+
+        // A verified callback may be the first evidence of a mandate accepted after
+        // the create API timed out. Correlate only using the setup ID originally sent
+        // to the provider, with exact tenant, schedule, rail and provider matches.
+        // A browser return, a guessed reference or an uncorrelated callback never
+        // resolves an uncertain registration.
+        if (event.merchantSetupId) {
+          const setup = (
+            await c.query(
+              `SELECT id,status,provider_reference
+               FROM payment_mandate_setup_requests
+               WHERE id=$1 AND tenant_id=$2 AND schedule_id=$3
+                 AND rail=$4 AND provider=$5
+               FOR UPDATE`,
+              [event.merchantSetupId, tenantId, event.scheduleId, event.rail, provider],
+            )
+          ).rows[0];
+          const occupied = (
+            await c.query(
+              `SELECT id FROM payment_mandate_setup_requests
+               WHERE tenant_id=$1 AND provider=$2 AND provider_reference=$3
+                 AND id<>$4 LIMIT 1`,
+              [tenantId, provider, event.providerReference, event.merchantSetupId],
+            )
+          ).rows[0];
+          if (
+            !setup ||
+            !['requested', 'created', 'uncertain', 'active'].includes(setup.status) ||
+            (setup.provider_reference && setup.provider_reference !== event.providerReference) ||
+            occupied
+          ) {
+            await c.query(
+              `UPDATE payment_provider_events
+               SET status='failed',failure_code='MANDATE_SETUP_CORRELATION_MISMATCH'
+               WHERE id=$1`,
+              [inserted.id],
+            );
+            await this.db.audit(
+              c,
+              'provider:' + provider,
+              'fees.mandate.setup_correlation_rejected',
+              event.merchantSetupId,
+              { providerEventId: event.eventId, scheduleId: event.scheduleId },
+            );
+            return {
+              accepted: false,
+              duplicate: false,
+              status: 'failed',
+              code: 'MANDATE_SETUP_CORRELATION_MISMATCH',
+            };
+          }
+          if (!setup.provider_reference) {
+            await c.query(
+              `UPDATE payment_mandate_setup_requests
+               SET provider_reference=$2,updated_at=now()
+               WHERE id=$1 AND provider_reference IS NULL`,
+              [setup.id, event.providerReference],
+            );
+            await this.db.audit(
+              c,
+              'provider:' + provider,
+              'fees.mandate.setup_correlated',
+              setup.id,
+              { providerEventId: event.eventId, providerReference: event.providerReference },
+            );
+          }
+        }
+
+        const mandate = existingMandate
+          ? (
+              await c.query(
+                `UPDATE payment_mandates
+                 SET status=$2,last_event_at=$3,recorded_by=NULL,recorded_via='provider'
+                 WHERE id=$1 RETURNING *`,
+                [existingMandate.id, event.status, event.occurredAt],
+              )
+            ).rows[0]
+          : (
+              await c.query(
+                `INSERT INTO payment_mandates(
+                   schedule_id,rail,provider,provider_reference,status,last_event_at,recorded_by,recorded_via
+                 ) VALUES($1,$2,$3,$4,$5,$6,NULL,'provider')
+                 RETURNING *`,
+                [
+                  event.scheduleId,
+                  event.rail,
+                  provider,
+                  event.providerReference,
+                  event.status,
+                  event.occurredAt,
+                ],
+              )
+            ).rows[0];
+
+        await c.query(
+          `UPDATE payment_mandate_setup_requests
+           SET status=CASE
+                 WHEN $4='active' THEN 'active'
+                 WHEN $4 IN('failed','revoked') THEN 'failed'
+                 ELSE 'created'
+               END,
+               failure_code=CASE WHEN $4 IN('failed','revoked') THEN upper($4) ELSE NULL END,
+               updated_at=now()
+           WHERE tenant_id=$1 AND provider=$2 AND provider_reference=$3
+             AND status IN('requested','created','uncertain')`,
+          [tenantId, provider, event.providerReference, event.status],
+        );
+        await c.query(
+          `UPDATE payment_provider_events
+           SET status='applied',applied_at=now()
+           WHERE id=$1`,
+          [inserted.id],
+        );
+        // Close an existing investigation only when this authenticated, correlated
+        // provider event establishes a terminal mandate outcome. The case closes
+        // for operations visibility; it neither retries nor moves money.
+        if (['active', 'failed', 'revoked'].includes(event.status)) {
+          const resolved = await c.query(
+            `UPDATE mandate_reconciliation_cases c
+             SET status='resolved_signed',resolved_at=now(),
+                 resolution_provider_event_id=$4,updated_at=now()
+             FROM payment_mandate_setup_requests r
+             WHERE c.setup_id=r.id AND c.tenant_id=r.tenant_id
+               AND c.tenant_id=$1 AND c.status='open'
+               AND r.provider=$2 AND r.provider_reference=$3
+               AND r.schedule_id=$5 AND r.rail=$6
+               AND r.status IN('active','failed')
+             RETURNING c.id,c.setup_id`,
+            [
+              tenantId,
+              provider,
+              event.providerReference,
+              inserted.id,
+              event.scheduleId,
+              event.rail,
+            ],
+          );
+          for (const row of resolved.rows) {
+            await this.db.audit(
+              c,
+              'provider:' + provider,
+              'fees.mandate_reconciliation.resolved_signed',
+              row.id,
+              {
+                setupId: row.setup_id,
+                providerEventId: event.eventId,
+                mandateStatus: event.status,
+              },
+            );
+          }
+        }
+        await this.db.audit(c, 'provider:' + provider, 'fees.mandate.provider_status', mandate.id, {
+          providerEventId: event.eventId,
+          scheduleId: event.scheduleId,
+          rail: event.rail,
+          status: event.status,
+          occurredAt: event.occurredAt,
+        });
+        return { accepted: true, duplicate: false, status: 'applied' };
+      }
+
+      const installment = (
+        await c.query(
+          `SELECT i.*,s.status AS schedule_status,s.currency,s.account_reference,s.payer_id,
+                  p.preferred_channel,
+                  (SELECT ast.full_name FROM student_fee_plan_assignments a JOIN academic_students ast ON ast.id=a.student_id AND ast.tenant_id=a.tenant_id WHERE a.tenant_id=s.tenant_id AND a.schedule_id=s.id ORDER BY a.assigned_on DESC LIMIT 1) AS student_name,
+                  (SELECT display_name FROM tenants WHERE id=s.tenant_id) AS institute_name
+           FROM fee_installments i
+           JOIN fee_schedules s ON s.id=i.schedule_id
+           LEFT JOIN fee_payers p ON p.id=s.payer_id
+           WHERE i.id=$1 AND s.tenant_id=$2
+           FOR UPDATE OF i,s`,
+          [event.installmentId, tenantId],
+        )
+      ).rows[0];
+
+      const checkout = (
+        await c.query(
+          `SELECT id,schedule_id,installment_id,amount_minor,status
+           FROM payment_checkout_sessions
+           WHERE tenant_id=$1 AND provider=$2 AND provider_reference=$3
+           FOR UPDATE`,
+          [tenantId, provider, event.providerReference],
+        )
+      ).rows[0];
+
+      // A signed debit confirmation can arrive while the debit-create call is
+      // still in flight, before we have stored the provider's reference. The
+      // original attempt ID is supplied to the bank in the create payload.
+      // It must match the exact tenant, installment, provider and amount.
+      const debitAttempt = event.merchantAttemptId
+        ? (
+            await c.query(
+              `SELECT id,schedule_id,installment_id,provider,provider_reference,
+                      amount_minor,currency,status
+               FROM autopay_debit_attempts
+               WHERE id=$1 AND tenant_id=$2 FOR UPDATE`,
+              [event.merchantAttemptId, tenantId],
+            )
+          ).rows[0]
+        : null;
+
+      const fail = async (code: string) => {
+        await c.query(
+          `UPDATE payment_provider_events
+           SET status='failed',failure_code=$2
+           WHERE id=$1`,
+          [inserted.id, code],
+        );
+        // A rejected or inconsistent *success* webhook is not evidence
+        // that the underlying customer checkout actually failed.
+        // Preserve its state for provider inquiry and reconciliation.
+        await this.db.audit(c, 'provider:' + provider, 'payment.provider_rejected', inserted.id, {
+          providerEventId: event.eventId,
+          code,
+          checkoutSessionId: checkout?.id || null,
+        });
+        return { accepted: false, duplicate: false, status: 'failed', code };
+      };
+
+      if (!installment) return fail('UNKNOWN_INSTALLMENT');
+      if (installment.schedule_status !== 'active') return fail('SCHEDULE_NOT_ACTIVE');
+      if (installment.status === 'cancelled') return fail('INSTALLMENT_CANCELLED');
+      if (installment.currency !== event.currency) return fail('CURRENCY_MISMATCH');
+      if (
+        checkout &&
+        (checkout.installment_id !== event.installmentId ||
+          Number(checkout.amount_minor) !== event.amountMinor ||
+          checkout.schedule_id !== installment.schedule_id)
+      )
+        return fail('CHECKOUT_MISMATCH');
+
+      if (event.merchantAttemptId) {
+        const correlated =
+          debitAttempt &&
+          debitAttempt.schedule_id === installment.schedule_id &&
+          debitAttempt.installment_id === event.installmentId &&
+          debitAttempt.provider === provider &&
+          Number(debitAttempt.amount_minor) === event.amountMinor &&
+          debitAttempt.currency === event.currency &&
+          ['uncertain', 'submitted', 'failed', 'confirmed'].includes(debitAttempt.status) &&
+          (!debitAttempt.provider_reference ||
+            debitAttempt.provider_reference === event.providerReference);
+        if (!correlated || checkout) return fail('DEBIT_ATTEMPT_CORRELATION_MISMATCH');
+        const referenceUsed = (
+          await c.query(
+            `SELECT id FROM autopay_debit_attempts
+             WHERE tenant_id=$1 AND provider=$2 AND provider_reference=$3 AND id<>$4
+             LIMIT 1`,
+            [tenantId, provider, event.providerReference, event.merchantAttemptId],
+          )
+        ).rows[0];
+        if (referenceUsed) return fail('DEBIT_ATTEMPT_REFERENCE_CONFLICT');
+      }
+
+      const existingPayment = (
+        await c.query(
+          `SELECT id FROM payment_records
+           WHERE tenant_id=$1 AND provider=$2 AND provider_reference=$3`,
+          [tenantId, provider, event.providerReference],
+        )
+      ).rows[0];
+      if (existingPayment) {
+        await c.query(
+          `UPDATE payment_provider_events
+           SET status='ignored',failure_code='DUPLICATE_PROVIDER_REFERENCE',applied_at=now()
+           WHERE id=$1`,
+          [inserted.id],
+        );
+        return {
+          accepted: true,
+          duplicate: true,
+          status: 'ignored',
+          code: 'DUPLICATE_PROVIDER_REFERENCE',
+        };
+      }
+
+      const remaining =
+        Number(installment.amount_minor) -
+        Number(installment.adjustment_amount_minor || 0) -
+        Number(installment.paid_amount_minor);
+      if (event.amountMinor > remaining) return fail('AMOUNT_EXCEEDS_BALANCE');
+
+      const payment = (
+        await c.query(
+          `INSERT INTO payment_records(
+             schedule_id,installment_id,idempotency_key,provider,provider_reference,
+             amount_minor,currency,evidence_note,recorded_by,recorded_via,provider_event_id
+           ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,NULL,'provider',$9)
+           RETURNING *`,
+          [
+            installment.schedule_id,
+            event.installmentId,
+            randomUUID(),
+            provider,
+            event.providerReference,
+            event.amountMinor,
+            event.currency,
+            'Verified signed provider webhook ' + event.eventId,
+            inserted.id,
+          ],
+        )
+      ).rows[0];
+
+      if (checkout) {
+        await c.query(
+          `INSERT INTO payment_component_allocations(payment_id,component_code,amount_minor)
+           SELECT $1,component_code,amount_minor
+           FROM payment_checkout_allocations
+           WHERE session_id=$2
+           ON CONFLICT(payment_id,component_code) DO NOTHING`,
+          [payment.id, checkout.id],
+        );
+        await c.query(
+          `UPDATE payment_checkout_sessions
+           SET status='completed',completed_payment_id=$2,failure_code=NULL,updated_at=now()
+           WHERE id=$1`,
+          [checkout.id, payment.id],
+        );
+      }
+
+      if (event.merchantAttemptId) {
+        await c.query(
+          `UPDATE autopay_debit_attempts
+           SET provider_reference=$2,status='confirmed',completed_at=now(),
+               failure_code=NULL,next_retry_at=NULL,updated_at=now()
+           WHERE id=$1 AND tenant_id=$3 AND provider=$4
+             AND installment_id=$5 AND amount_minor=$6 AND currency=$7
+             AND status IN('submitted','uncertain','failed')
+             AND (provider_reference IS NULL OR provider_reference=$2)`,
+          [
+            event.merchantAttemptId,
+            event.providerReference,
+            tenantId,
+            provider,
+            event.installmentId,
+            event.amountMinor,
+            event.currency,
+          ],
+        );
+        await this.db.audit(
+          c,
+          'provider:' + provider,
+          'fees.autopay.signed_attempt_correlated',
+          event.merchantAttemptId,
+          { providerEventId: event.eventId, providerReference: event.providerReference },
+        );
+      } else {
+        await c.query(
+          `UPDATE autopay_debit_attempts
+           SET status='confirmed',completed_at=now(),failure_code=NULL,next_retry_at=NULL,updated_at=now()
+           WHERE tenant_id=$1 AND provider=$2 AND provider_reference=$3
+             AND status IN('submitted','queued','uncertain','failed')`,
+          [tenantId, provider, event.providerReference],
+        );
+      }
+
+      const nextPaid = Number(installment.paid_amount_minor) + event.amountMinor;
+      const nextStatus =
+        nextPaid + Number(installment.adjustment_amount_minor || 0) ===
+        Number(installment.amount_minor)
+          ? 'paid'
+          : 'part_paid';
+      await c.query('UPDATE fee_installments SET paid_amount_minor=$2,status=$3 WHERE id=$1', [
+        event.installmentId,
+        nextPaid,
+        nextStatus,
+      ]);
+
+      await syncQueuedDebitBalances(
+        c,
+        this.db,
+        tenantId,
+        event.installmentId,
+        'provider:' + provider,
+      );
+      const open = (
+        await c.query(
+          `SELECT count(*)::int AS count
+           FROM fee_installments
+           WHERE schedule_id=$1 AND status NOT IN('paid','cancelled')`,
+          [installment.schedule_id],
+        )
+      ).rows[0]!.count;
+      if (open === 0)
+        await c.query(
+          `UPDATE fee_schedules
+           SET status='completed',version=version+1,updated_at=now()
+           WHERE id=$1`,
+          [installment.schedule_id],
+        );
+
+      Object.assign(
+        installment,
+        await receiptContact(c, this.db, tenantId, installment.schedule_id, 'provider:' + provider),
+      );
+      const receiptNumber = 'RCP-' + randomUUID().replaceAll('-', '').toUpperCase();
+      const receipt = (
+        await c.query(
+          `INSERT INTO fee_receipts(payment_id,receipt_number,snapshot)
+           VALUES($1,$2,$3)
+           RETURNING id,receipt_number,issued_at`,
+          [
+            payment.id,
+            receiptNumber,
+            {
+              receiptConfig:
+                (
+                  await c.query(
+                    'SELECT receipt_config FROM receipt_email_configs WHERE tenant_id=$1',
+                    [capturedTenantId],
+                  )
+                ).rows[0]?.receipt_config || {},
+              emailConfig:
+                (
+                  await c.query(
+                    'SELECT email_config FROM receipt_email_configs WHERE tenant_id=$1',
+                    [capturedTenantId],
+                  )
+                ).rows[0]?.email_config || {},
+              studentName: installment.student_name || null,
+              instituteName: installment.institute_name || null,
+              scheduleId: installment.schedule_id,
+              accountReference: installment.account_reference,
+              installmentId: event.installmentId,
+              amountMinor: event.amountMinor,
+              currency: event.currency,
+              providerReference: event.providerReference,
+              provider,
+              providerEventId: event.eventId,
+              occurredAt: event.occurredAt,
+            },
+          ],
+        )
+      ).rows[0];
+
+      const outboxEventId = randomUUID();
+      const payerCommunication = Boolean(
+        installment.payer_id &&
+        installment.preferred_channel &&
+        installment.preferred_channel !== 'none',
+      );
+      await c.query(
+        `INSERT INTO outbox(event_id,type,aggregate_id,payload)
+         VALUES($1,'payment.external_confirmed',$2,$3)`,
+        [
+          outboxEventId,
+          payment.id,
+          {
+            scheduleId: installment.schedule_id,
+            amountMinor: event.amountMinor,
+            receiptId: receipt.id,
+            receiptNumber: receipt.receipt_number,
+            payerCommunication,
+          },
+        ],
+      );
+
+      if (payerCommunication) {
+        await c.query(
+          `INSERT INTO fee_communication_log(
+             event_id,schedule_id,installment_id,payer_id,channel,kind,status
+           ) VALUES($1,$2,$3,$4,$5,'receipt','pending')`,
+          [
+            outboxEventId,
+            installment.schedule_id,
+            event.installmentId,
+            installment.payer_id,
+            installment.preferred_channel,
+          ],
+        );
+      }
+
+      await c.query(
+        `UPDATE payment_provider_events
+         SET status='applied',applied_at=now()
+         WHERE id=$1`,
+        [inserted.id],
+      );
+      await this.db.audit(
+        c,
+        'provider:' + provider,
+        'fees.payment.provider_confirmed',
+        payment.id,
+        {
+          providerEventId: event.eventId,
+          providerReference: event.providerReference,
+          installmentId: event.installmentId,
+          amountMinor: event.amountMinor,
+          currency: event.currency,
+          occurredAt: event.occurredAt,
+          receiptNumber: receipt.receipt_number,
+          outboxEventId,
+          checkoutSessionId: checkout?.id || null,
+        },
+      );
+
+      const result = {
+        accepted: true,
+        duplicate: false,
+        status: 'applied',
+        paymentId: payment.id,
+        receiptId: receipt.id,
+        receiptNumber: receipt.receipt_number,
+      };
+      return result;
+    });
+
+    return txResult;
+  }
+}
+
+@Controller('v1/admin/fees/provider-events')
+@UseGuards(AuthGuard)
+@Roles('owner')
+export class PaymentProviderAdminController {
+  constructor(@Inject(Db) private db: Db) {}
+
+  @Get()
+  async list(@Req() req: AuthedRequest) {
+    return this.db.query(
+      `SELECT id,provider,provider_event_id,event_type,status,failure_code,received_at,applied_at
+       FROM payment_provider_events
+       WHERE tenant_id=$1
+       ORDER BY received_at DESC
+       LIMIT 300`,
+      [req.actor.tenantId],
+    );
+  }
+}

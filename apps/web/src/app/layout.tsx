@@ -1,0 +1,23 @@
+import type { Metadata } from 'next';
+import '../styles/globals.css';
+import { ErrorSuppressor } from '@/components/common/error-suppressor';
+
+export const metadata: Metadata = {
+  title: { default: 'Dodo', template: '%s' },
+  description: 'Education payments website, owner console and payer portal',
+  robots: { index: false, follow: false },
+};
+
+export default function RootLayout({ children }: { children: React.ReactNode }) {
+  return (
+    <html lang="en-IN">
+      <body>
+        <ErrorSuppressor />
+        <a className="skip-link" href="#main">
+          Skip to content
+        </a>
+        {children}
+      </body>
+    </html>
+  );
+}
