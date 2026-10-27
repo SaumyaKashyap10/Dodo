@@ -278,29 +278,38 @@ export function SettlementsView() {
             <p className="small">There are currently no settlement records matching your filter criteria.</p>
           </div>
         ) : (
-          <div className="admin-table-wrap">
-            <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: 'var(--text-sm)' }}>
+          <div className="admin-table-wrap" style={{ overflowX: 'auto', WebkitOverflowScrolling: 'touch' }}>
+            <table
+              className="admin-table"
+              style={{
+                width: '100%',
+                minWidth: '1100px',
+                borderCollapse: 'collapse',
+                textAlign: 'left',
+                fontSize: 'var(--text-sm)',
+              }}
+            >
               <thead>
                 <tr style={{ background: '#f8fafc', borderBottom: '1px solid var(--surface-border)' }}>
-                  <th style={{ padding: '12px 16px', fontWeight: 600 }}>Settlement Reference</th>
-                  <th style={{ padding: '12px 16px', fontWeight: 600 }}>Provider Rail</th>
-                  <th style={{ padding: '12px 16px', fontWeight: 600 }}>Settlement Amount</th>
-                  <th style={{ padding: '12px 16px', fontWeight: 600 }}>Settlement Date</th>
-                  <th style={{ padding: '12px 16px', fontWeight: 600 }}>Masked Bank Account</th>
-                  <th style={{ padding: '12px 16px', fontWeight: 600 }}>Bank UTR</th>
-                  <th style={{ padding: '12px 16px', fontWeight: 600 }}>Associated Payments</th>
-                  <th style={{ padding: '12px 16px', fontWeight: 600 }}>Status</th>
-                  <th style={{ padding: '12px 16px', fontWeight: 600, textAlign: 'right' }}>Actions</th>
+                  <th style={{ padding: '12px 16px', fontWeight: 600, whiteSpace: 'nowrap', minWidth: '160px' }}>Settlement Reference</th>
+                  <th style={{ padding: '12px 16px', fontWeight: 600, whiteSpace: 'nowrap', minWidth: '130px' }}>Provider Rail</th>
+                  <th style={{ padding: '12px 16px', fontWeight: 600, whiteSpace: 'nowrap', minWidth: '140px', textAlign: 'right' }}>Settlement Amount</th>
+                  <th style={{ padding: '12px 16px', fontWeight: 600, whiteSpace: 'nowrap', minWidth: '120px' }}>Settlement Date</th>
+                  <th style={{ padding: '12px 16px', fontWeight: 600, whiteSpace: 'nowrap', minWidth: '160px' }}>Masked Bank Account</th>
+                  <th style={{ padding: '12px 16px', fontWeight: 600, whiteSpace: 'nowrap', minWidth: '150px' }}>Bank UTR</th>
+                  <th style={{ padding: '12px 16px', fontWeight: 600, whiteSpace: 'nowrap', minWidth: '160px' }}>Associated Payments</th>
+                  <th style={{ padding: '12px 16px', fontWeight: 600, whiteSpace: 'nowrap', minWidth: '100px', textAlign: 'center' }}>Status</th>
+                  <th style={{ padding: '12px 16px', fontWeight: 600, whiteSpace: 'nowrap', minWidth: '120px', textAlign: 'right' }}>Actions</th>
                 </tr>
               </thead>
               <tbody>
                 {data.rows.map((row) => (
-                  <tr key={row.id} style={{ borderBottom: '1px solid var(--surface-border)' }}>
-                    <td style={{ padding: '12px 16px', fontWeight: 600, fontFamily: 'monospace', color: '#0f172a' }}>
+                  <tr key={row.id} style={{ borderBottom: '1px solid var(--surface-border)', verticalAlign: 'middle' }}>
+                    <td style={{ padding: '12px 16px', fontWeight: 600, fontFamily: 'monospace', color: '#0f172a', whiteSpace: 'nowrap' }}>
                       {row.provider_reference}
                     </td>
-                    <td style={{ padding: '12px 16px' }}>{row.provider}</td>
-                    <td style={{ padding: '12px 16px', fontWeight: 700, color: 'var(--text-main)' }}>
+                    <td style={{ padding: '12px 16px', whiteSpace: 'nowrap' }}>{row.provider}</td>
+                    <td style={{ padding: '12px 16px', fontWeight: 700, color: 'var(--text-main)', whiteSpace: 'nowrap', textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>
                       {formatMoney(row.amount_minor)}
                     </td>
                     <td style={{ padding: '12px 16px', color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>
@@ -310,13 +319,13 @@ export function SettlementsView() {
                         year: 'numeric',
                       })}
                     </td>
-                    <td style={{ padding: '12px 16px', color: 'var(--text-muted)' }}>
+                    <td style={{ padding: '12px 16px', color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>
                       {row.masked_bank_account}
                     </td>
-                    <td style={{ padding: '12px 16px', fontFamily: 'monospace', fontSize: '12px', color: '#0f766e', fontWeight: 600 }}>
+                    <td style={{ padding: '12px 16px', fontFamily: 'monospace', fontSize: '12px', color: '#0f766e', fontWeight: 600, whiteSpace: 'nowrap' }}>
                       {row.bank_utr}
                     </td>
-                    <td style={{ padding: '12px 16px' }}>
+                    <td style={{ padding: '12px 16px', whiteSpace: 'nowrap' }}>
                       <button
                         type="button"
                         onClick={() => setLinkedPaymentsSettlement(row)}
@@ -329,20 +338,21 @@ export function SettlementsView() {
                           fontSize: '12px',
                           fontWeight: 600,
                           cursor: 'pointer',
+                          whiteSpace: 'nowrap',
                         }}
                         title="Click to view linked student fee payments"
                       >
                         {row.payment_count} payments ↗
                       </button>
                     </td>
-                    <td style={{ padding: '12px 16px' }}>
+                    <td style={{ padding: '12px 16px', whiteSpace: 'nowrap', textAlign: 'center' }}>
                       <span className={financialStatusClass(row.status)}>{row.status}</span>
                     </td>
                     <td style={{ padding: '12px 16px', textAlign: 'right', whiteSpace: 'nowrap' }}>
                       <button
                         type="button"
                         className="button secondary"
-                        style={{ padding: '4px 8px', fontSize: '12px' }}
+                        style={{ padding: '4px 10px', fontSize: '12px', fontWeight: 500 }}
                         onClick={() => setSelectedSettlement(row)}
                       >
                         View Payout

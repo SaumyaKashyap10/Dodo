@@ -18,21 +18,11 @@ export function OwnerRevenue() {
   // Modals
   const [selectedInvoice, setSelectedInvoice] = useState<any | null>(null);
   const [invoiceModalOpen, setInvoiceModalOpen] = useState(false);
-  const [manualPayModalOpen, setManualPayModalOpen] = useState(false);
   const [advanceAdjustModalOpen, setAdvanceAdjustModalOpen] = useState(false);
   const [selectedInstForAdvance, setSelectedInstForAdvance] = useState<any | null>(null);
   const [editRateModalOpen, setEditRateModalOpen] = useState(false);
   const [selectedRate, setSelectedRate] = useState<any | null>(null);
   const [submitting, setSubmitting] = useState(false);
-
-  // Manual payment form
-  const [manualPayForm, setManualPayForm] = useState({
-    tenant_id: '',
-    plan_id: 'plan_growth',
-    amount_inr: 3000,
-    payment_method: 'bank_neft',
-    reference_id: '',
-  });
 
   // Advance adjust form
   const [advanceForm, setAdvanceForm] = useState({
@@ -62,10 +52,6 @@ export function OwnerRevenue() {
           setData(revRes);
           setInstitutions(instRes || []);
           if (instRes && instRes[0]) {
-            setManualPayForm((prev) => ({
-              ...prev,
-              tenant_id: instRes[0].id,
-            }));
             setSelectedInstForAdvance(instRes[0]);
           }
         }
@@ -124,34 +110,6 @@ export function OwnerRevenue() {
       gst_percentage: rate.gst_percentage || 18,
     });
     setEditRateModalOpen(true);
-  };
-
-  const handleRecordManualPayment = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!manualPayForm.tenant_id || !manualPayForm.reference_id.trim()) return;
-    setSubmitting(true);
-    try {
-      await api('/v1/owner/revenue/record-payment', {
-        method: 'POST',
-        body: JSON.stringify({
-          ...manualPayForm,
-          amount_inr: Number(manualPayForm.amount_inr),
-        }),
-      });
-      setManualPayModalOpen(false);
-      setManualPayForm({
-        tenant_id: institutions[0]?.id || '',
-        plan_id: 'plan_growth',
-        amount_inr: 3000,
-        payment_method: 'bank_neft',
-        reference_id: '',
-      });
-      refreshData();
-    } catch (e: any) {
-      alert(e.message || 'Failed to record subscription payment');
-    } finally {
-      setSubmitting(false);
-    }
   };
 
   const handleSaveAdvanceAdjustment = async (e: React.FormEvent) => {
@@ -250,12 +208,6 @@ export function OwnerRevenue() {
               />
             </svg>
             Export Billing CSV
-          </button>
-          <button
-            onClick={() => setManualPayModalOpen(true)}
-            className="pharmacy-pill-dark h-9 px-4 text-xs font-semibold flex items-center justify-center gap-1.5 cursor-pointer whitespace-nowrap shrink-0"
-          >
-            + Record Offline / Wire Payment
           </button>
         </div>
       </div>
@@ -993,97 +945,6 @@ export function OwnerRevenue() {
             </div>
           </div>
         )}
-      </OwnerModal>
-
-      {/* Modal 2: Record Offline / Manual Payment */}
-      <OwnerModal
-        isOpen={manualPayModalOpen}
-        onClose={() => setManualPayModalOpen(false)}
-        title="Record Subscription Payment"
-        subtitle="Manually credit an offline bank NEFT, wire transfer, or cheque receipt"
-        maxWidth="max-w-md"
-      >
-        <form onSubmit={handleRecordManualPayment} className="space-y-4">
-          <div>
-            <label className="block text-xs font-semibold text-slate-700 mb-1">Institution</label>
-            <select
-              value={manualPayForm.tenant_id}
-              onChange={(e) => setManualPayForm({ ...manualPayForm, tenant_id: e.target.value })}
-              className="w-full h-9 px-3 text-xs bg-slate-50 border border-slate-300 rounded-lg focus:outline-none focus:ring-1 focus:ring-teal-500 focus:bg-white cursor-pointer"
-            >
-              {institutions.map((inst) => (
-                <option key={inst.id} value={inst.id}>
-                  {inst.display_name}
-                </option>
-              ))}
-            </select>
-          </div>
-
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label className="block text-xs font-semibold text-slate-700 mb-1">
-                Amount Paid (₹)
-              </label>
-              <input
-                type="number"
-                required
-                min={100}
-                value={manualPayForm.amount_inr}
-                onChange={(e) =>
-                  setManualPayForm({ ...manualPayForm, amount_inr: Number(e.target.value) })
-                }
-                className="w-full h-9 px-3 text-xs bg-slate-50 border border-slate-300 rounded-lg font-bold focus:outline-none focus:ring-1 focus:ring-teal-500 focus:bg-white"
-              />
-            </div>
-
-            <div>
-              <label className="block text-xs font-semibold text-slate-700 mb-1">Method</label>
-              <select
-                value={manualPayForm.payment_method}
-                onChange={(e) =>
-                  setManualPayForm({ ...manualPayForm, payment_method: e.target.value })
-                }
-                className="w-full h-9 px-3 text-xs bg-slate-50 border border-slate-300 rounded-lg focus:outline-none focus:ring-1 focus:ring-teal-500 focus:bg-white cursor-pointer"
-              >
-                <option value="bank_neft">Bank NEFT / RTGS</option>
-                <option value="upi_direct">Direct UPI Wire</option>
-                <option value="razorpay">Razorpay Order ID</option>
-                <option value="cheque">Bank Demand Draft / Cheque</option>
-              </select>
-            </div>
-          </div>
-
-          <div>
-            <label className="block text-xs font-semibold text-slate-700 mb-1">
-              Transaction UTR / Reference ID
-            </label>
-            <input
-              type="text"
-              required
-              value={manualPayForm.reference_id}
-              onChange={(e) => setManualPayForm({ ...manualPayForm, reference_id: e.target.value })}
-              placeholder="e.g. HDFCN26295018491 or pay_rzp_..."
-              className="w-full h-9 px-3 text-xs bg-slate-50 border border-slate-300 rounded-lg font-mono focus:outline-none focus:ring-1 focus:ring-teal-500 focus:bg-white"
-            />
-          </div>
-
-          <div className="pt-3 border-t border-slate-100 flex items-center justify-end gap-2">
-            <button
-              type="button"
-              onClick={() => setManualPayModalOpen(false)}
-              className="pharmacy-pill-light h-9 px-4 text-xs font-bold text-[#063331] rounded-full cursor-pointer"
-            >
-              Cancel
-            </button>
-            <button
-              type="submit"
-              disabled={submitting}
-              className="pharmacy-pill-dark h-9 px-5 text-xs font-bold text-white rounded-full shadow-xs cursor-pointer"
-            >
-              {submitting ? 'Recording…' : 'Record & Extend Period'}
-            </button>
-          </div>
-        </form>
       </OwnerModal>
 
       {/* Modal 3: Adjust Institution Advance Balance */}

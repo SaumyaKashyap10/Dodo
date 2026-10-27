@@ -1,7 +1,16 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { randomBytes } from 'node:crypto';
 import { handleEnachRoute } from '@/lib/enach/backend-service';
 import { handleOwnerRoute } from '@/lib/owner-backend-service';
 import { loginOwner, validateSession, revokeSession, guardOwnerRoute } from '@/lib/server-auth';
+import { registerSecurePayerToken, getRegisteredSecureToken, STUDENT_PROFILES } from '@/lib/payer-store';
+import {
+  getStudentRoster,
+  findRosterStudent,
+  recoverOrCreateStudent,
+  getFilteredStudents,
+} from '@/lib/student-roster';
+import { recordStudentPayment, reconcileStudentExcess, calculateFeeSummary, findStudentAccount } from '@/lib/student-ledger';
 
 const DEMO_USER = {
   id: 'usr-demo-owner',
@@ -334,221 +343,23 @@ const DEMO_PAYERS_LIST = [
   { id: 'payer-4', display_name: 'Rakesh Guardian (V Rakesh)', name: 'Rakesh Guardian', account_reference: 'test', phone: '+91 98765 00000', email: 'rakesh.g@example.com', student_name: 'V Rakesh' },
 ];
 
-const DEMO_STUDENTS = [
-  {
-    id: 'stu-rakesh',
-    full_name: 'V Rakesh',
-    student_reference: 'test',
-    status: 'enrolled',
-    institute: 'Delhi Public School (Demo)',
-    group_name: 'Grade 10-A',
-    course: 'CBSE Secondary',
-    grade: '10',
-    academic_year: '2026-27',
-    campus: 'Delhi Main Campus',
-    email: 'rakesh.student@example.com',
-    phone: '+91 98765 00000',
-    guardian_name: 'Rakesh Guardian',
-    guardian_email: 'rakesh.guardian@example.com',
-    guardian_phone: '+91 98765 43210',
-    enach_status: 'pending',
-    net_payable_minor: '12000000',
-    paid_minor: '0',
-    outstanding_minor: '12000000',
+const DEMO_STUDENTS: any[] = new Proxy([] as any[], {
+  get(target, prop, receiver) {
+    const list = getStudentRoster();
+    if (prop === 'length') return list.length;
+    if (typeof prop === 'string' && !isNaN(Number(prop))) {
+      return list[Number(prop)];
+    }
+    const val = Reflect.get(list, prop, receiver);
+    if (typeof val === 'function') {
+      return val.bind(list);
+    }
+    return val;
   },
-  {
-    id: 'stu-1',
-    full_name: 'Aarav Sharma',
-    student_reference: 'DPS-2026-089',
-    status: 'enrolled',
-    institute: 'Delhi Public School (Demo)',
-    group_name: 'Grade 10-A',
-    course: 'CBSE Secondary',
-    grade: '10',
-    academic_year: '2026-27',
-    enach_status: 'active',
-    net_payable_minor: '12000000',
-    paid_minor: '6000000',
-    outstanding_minor: '6000000',
+  set() {
+    return true;
   },
-  {
-    id: 'stu-2',
-    full_name: 'Diya Patel',
-    student_reference: 'DPS-2026-104',
-    status: 'enrolled',
-    institute: 'Delhi Public School (Demo)',
-    group_name: 'Grade 8-B',
-    course: 'CBSE Middle School',
-    grade: '8',
-    academic_year: '2026-27',
-    enach_status: 'active',
-    net_payable_minor: '11000000',
-    paid_minor: '7500000',
-    outstanding_minor: '3500000',
-  },
-  {
-    id: 'stu-3',
-    full_name: 'Rohan Mehta',
-    student_reference: 'DPS-2026-141',
-    status: 'enrolled',
-    institute: 'Delhi Public School (Demo)',
-    group_name: 'Grade 12-Science',
-    course: 'CBSE Senior Secondary',
-    grade: '12',
-    academic_year: '2026-27',
-    enach_status: 'pending',
-    net_payable_minor: '14500000',
-    paid_minor: '5000000',
-    outstanding_minor: '9500000',
-  },
-  {
-    id: 'stu-4',
-    full_name: 'Kavya Reddy',
-    student_reference: 'DPS-2026-055',
-    status: 'enrolled',
-    institute: 'Delhi Public School (Demo)',
-    group_name: 'Grade 5-B',
-    course: 'Primary Foundation',
-    grade: '5',
-    academic_year: '2026-27',
-    campus: 'Delhi South Campus',
-    email: 'kavya.student@example.com',
-    phone: '+91 98765 00004',
-    guardian_name: 'Venkat Reddy',
-    guardian_email: 'venkat.reddy@example.com',
-    guardian_phone: '+91 98765 43213',
-    enach_status: 'active',
-    net_payable_minor: '14000000',
-    paid_minor: '7000000',
-    outstanding_minor: '7000000',
-  },
-  {
-    id: 'stu-5',
-    full_name: 'Ananya Gupta',
-    student_reference: 'DPS-2026-062',
-    status: 'enrolled',
-    institute: 'Delhi Public School (Demo)',
-    group_name: 'Grade 9-A',
-    course: 'CBSE Secondary',
-    grade: '9',
-    academic_year: '2026-27',
-    campus: 'Delhi Main Campus',
-    email: 'ananya.student@example.com',
-    phone: '+91 98765 00005',
-    guardian_name: 'Pooja Gupta',
-    guardian_email: 'pooja.gupta@example.com',
-    guardian_phone: '+91 98765 43214',
-    enach_status: 'active',
-    net_payable_minor: '12500000',
-    paid_minor: '6000000',
-    outstanding_minor: '6500000',
-  },
-  {
-    id: 'stu-6',
-    full_name: 'Vivaan Malhotra',
-    student_reference: 'DPS-2026-077',
-    status: 'enrolled',
-    institute: 'Delhi Public School (Demo)',
-    group_name: 'Grade 7-A',
-    course: 'Middle School',
-    grade: '7',
-    academic_year: '2026-27',
-    campus: 'Delhi Main Campus',
-    email: 'vivaan.student@example.com',
-    phone: '+91 98765 00006',
-    guardian_name: 'Karan Malhotra',
-    guardian_email: 'karan.malhotra@example.com',
-    guardian_phone: '+91 98765 43215',
-    enach_status: 'active',
-    net_payable_minor: '16000000',
-    paid_minor: '8000000',
-    outstanding_minor: '8000000',
-  },
-  {
-    id: 'stu-7',
-    full_name: 'Ishan Verma',
-    student_reference: 'DPS-2026-092',
-    status: 'enrolled',
-    institute: 'Delhi Public School (Demo)',
-    group_name: 'Grade 11-Commerce',
-    course: 'CBSE Senior Secondary',
-    grade: '11',
-    academic_year: '2026-27',
-    campus: 'Delhi South Campus',
-    email: 'ishan.student@example.com',
-    phone: '+91 98765 00007',
-    guardian_name: 'Sunita Verma',
-    guardian_email: 'sunita.verma@example.com',
-    guardian_phone: '+91 98765 43216',
-    enach_status: 'pending',
-    net_payable_minor: '13500000',
-    paid_minor: '3500000',
-    outstanding_minor: '10000000',
-  },
-  {
-    id: 'stu-8',
-    full_name: 'Tara Nair',
-    student_reference: 'DPS-2026-118',
-    status: 'enrolled',
-    institute: 'Delhi Public School (Demo)',
-    group_name: 'Grade 6-C',
-    course: 'CBSE Middle School',
-    grade: '6',
-    academic_year: '2026-27',
-    campus: 'Delhi Main Campus',
-    email: 'tara.student@example.com',
-    phone: '+91 98765 00008',
-    guardian_name: 'Madhavan Nair',
-    guardian_email: 'madhavan.nair@example.com',
-    guardian_phone: '+91 98765 43217',
-    enach_status: 'active',
-    net_payable_minor: '12800000',
-    paid_minor: '6400000',
-    outstanding_minor: '6400000',
-  },
-  {
-    id: 'stu-9',
-    full_name: 'Aditya Joshi',
-    student_reference: 'DPS-2026-133',
-    status: 'enrolled',
-    institute: 'Delhi Public School (Demo)',
-    group_name: 'Grade 10-B',
-    course: 'CBSE Secondary',
-    grade: '10',
-    academic_year: '2026-27',
-    campus: 'Delhi South Campus',
-    email: 'aditya.student@example.com',
-    phone: '+91 98765 00009',
-    guardian_name: 'Sanjay Joshi',
-    guardian_email: 'sanjay.joshi@example.com',
-    guardian_phone: '+91 98765 43218',
-    enach_status: 'failed',
-    net_payable_minor: '11200000',
-    paid_minor: '2800000',
-    outstanding_minor: '8400000',
-  },
-  {
-    id: 'stu-10',
-    full_name: 'Meera Singhania',
-    student_reference: 'DPS-2026-150',
-    status: 'enrolled',
-    institute: 'Delhi Public School (Demo)',
-    group_name: 'Grade 12-Arts',
-    course: 'CBSE Senior Secondary',
-    grade: '12',
-    academic_year: '2026-27',
-    campus: 'Delhi Main Campus',
-    email: 'meera.student@example.com',
-    phone: '+91 98765 00010',
-    guardian_name: 'Alok Singhania',
-    guardian_email: 'alok.singhania@example.com',
-    guardian_phone: '+91 98765 43219',
-    enach_status: 'cancelled',
-    net_payable_minor: '15000000',
-    paid_minor: '4500000',
-    outstanding_minor: '10500000',
-  },
-];
+});
 
 const DEMO_ACADEMIC_OVERVIEW = {
   students: [
@@ -1499,19 +1310,65 @@ const DEMO_SCHEDULES = [
     payer_id: 'g-3',
     status: 'active',
   },
+  {
+    id: 'sch-4',
+    account_reference: 'DPS-2026-055',
+    payer_id: 'g-4',
+    status: 'active',
+  },
+  {
+    id: 'sch-5',
+    account_reference: 'DPS-2026-062',
+    payer_id: 'g-5',
+    status: 'active',
+  },
+  {
+    id: 'sch-6',
+    account_reference: 'DPS-2026-077',
+    payer_id: 'g-6',
+    status: 'active',
+  },
+  {
+    id: 'sch-7',
+    account_reference: 'DPS-2026-092',
+    payer_id: 'g-7',
+    status: 'active',
+  },
+  {
+    id: 'sch-8',
+    account_reference: 'DPS-2026-118',
+    payer_id: 'g-8',
+    status: 'active',
+  },
+  {
+    id: 'sch-9',
+    account_reference: 'DPS-2026-133',
+    payer_id: 'g-9',
+    status: 'active',
+  },
+  {
+    id: 'sch-10',
+    account_reference: 'DPS-2026-150',
+    payer_id: 'g-10',
+    status: 'active',
+  },
+  {
+    id: 'sch-12',
+    account_reference: 'DPS-2026-160',
+    payer_id: 'g-12',
+    status: 'active',
+  },
+  {
+    id: 'sch-stu-12',
+    account_reference: 'DPS-2026-160',
+    payer_id: 'g-12',
+    status: 'active',
+  },
 ];
 
 async function handle(req: NextRequest, { params }: { params: Promise<{ route: string[] }> }) {
   const { route } = await params;
-  let path = route.join('/');
-
-  // Student namespace API aliases
-  if (path.startsWith('student/')) {
-    const portalSub = path.replace('student/', 'portal/');
-    // re-run handler with portalSub path
-    path = portalSub;
-  }
-
+  const path = route.join('/');
   const method = req.method;
 
   // 0. Owner CMS routes - Secured with Server Auth Guard & CSRF validation
@@ -1649,44 +1506,37 @@ async function handle(req: NextRequest, { params }: { params: Promise<{ route: s
       body = await req.json();
     } catch {}
 
-    const studentReference =
-      body.studentReference ||
-      body.student_reference ||
-      `DPS-2026-${String(DEMO_STUDENTS.length + 100).padStart(3, '0')}`;
-    const id = 'stu-' + (DEMO_STUDENTS.length + 1);
-    const newStudent = {
-      id,
-      full_name: body.fullName || body.full_name || 'New Student',
-      student_reference: studentReference,
-      status: body.status || 'enrolled',
-      institute: 'Delhi Public School (Demo)',
-      group_name: body.groupName || body.group_name || 'Grade 10-A',
-      course: body.course || 'CBSE Secondary',
-      grade: body.grade || '10',
-      academic_year: body.academicYear || body.academic_year || '2026-27',
-      campus: body.campus || 'Delhi Main Campus',
-      email: body.email || 'student@example.com',
-      phone: body.phone || '+91 98765 00000',
-      guardian_name: body.guardianName || body.guardian_name || 'Guardian',
-      guardian_email: body.guardianEmail || body.guardian_email || 'guardian@example.com',
-      guardian_phone: body.guardianPhone || body.guardian_phone || '+91 98765 11111',
-      enach_status: 'pending',
-      net_payable_minor: '12000000',
-      paid_minor: '0',
-      outstanding_minor: '12000000',
-    };
-    DEMO_STUDENTS.unshift(newStudent);
-    DEMO_ACADEMIC_OVERVIEW.students.unshift({
-      id: newStudent.id,
-      student_reference: newStudent.student_reference,
-      full_name: newStudent.full_name,
-      date_of_birth: '2010-01-01',
-      status: 'active',
-      branch_code: 'DEL-MAIN',
-      branch_name: 'Delhi Main Campus',
-      academic_year: newStudent.academic_year,
-    });
-    return NextResponse.json({ ok: true, ...newStudent });
+    try {
+      const result = recoverOrCreateStudent(body);
+      const student = result.student;
+
+      // Update academic overview
+      const existingOverviewIdx = DEMO_ACADEMIC_OVERVIEW.students.findIndex(
+        (s) => s.id === student.id || s.student_reference === student.student_reference,
+      );
+      const overviewEntry = {
+        id: student.id,
+        student_reference: student.student_reference,
+        full_name: student.full_name,
+        date_of_birth: '2010-01-01',
+        status: student.status || 'active',
+        branch_code: 'DEL-MAIN',
+        branch_name: 'Delhi Main Campus',
+        academic_year: student.academic_year || '2026-27',
+      };
+      if (existingOverviewIdx !== -1) {
+        DEMO_ACADEMIC_OVERVIEW.students[existingOverviewIdx] = overviewEntry;
+      } else {
+        DEMO_ACADEMIC_OVERVIEW.students.unshift(overviewEntry);
+      }
+
+      return NextResponse.json({ ok: true, recovered: result.recovered, created: result.created, ...student });
+    } catch (err: any) {
+      return NextResponse.json(
+        { message: err?.message || 'Failed to process student registration' },
+        { status: 400 },
+      );
+    }
   }
 
   if (path.startsWith('admin/fees/students/')) {
@@ -1695,24 +1545,14 @@ async function handle(req: NextRequest, { params }: { params: Promise<{ route: s
     const studentId = parts[0] || 'stu-1';
     const action = parts[1];
 
-    const defaultStudent = DEMO_STUDENTS[0] || {
-      id: 'stu-1',
-      full_name: 'Aarav Sharma',
-      student_reference: 'DPS-2026-089',
-      status: 'enrolled',
-      institute: 'Delhi Public School (Demo)',
-      group_name: 'Grade 10-A',
-      course: 'CBSE Secondary',
-      grade: '10',
-      academic_year: '2026-27',
-      enach_status: 'active',
-      net_payable_minor: '12000000',
-      paid_minor: '6000000',
-      outstanding_minor: '6000000',
-    };
-    const student =
-      DEMO_STUDENTS.find((s) => s.id === studentId || s.student_reference === studentId) ||
-      defaultStudent;
+    const student = findRosterStudent(studentId);
+
+    if (!student) {
+      return NextResponse.json(
+        { message: `Student '${studentId}' was not found` },
+        { status: 404 },
+      );
+    }
 
     if (action === 'payments' && method === 'POST') {
       let body: any = {};
@@ -1720,12 +1560,49 @@ async function handle(req: NextRequest, { params }: { params: Promise<{ route: s
         body = await req.json();
       } catch {}
       const amountMinor = Number(body.amountMinor || 2000000);
+      const allowExcess = Boolean(body.allowExcess || body.allowOverpayment);
 
       const currentPaid = Number(student.paid_minor || 0);
       const currentNet = Number(student.net_payable_minor || 12000000);
+      const currentOutstanding = Math.max(0, currentNet - currentPaid);
+      const existingExcess = Math.max(0, currentPaid - currentNet);
+
+      // Validate overpayments:
+      if (existingExcess > 0 && !allowExcess) {
+        return NextResponse.json(
+          {
+            error: 'overpayment_blocked',
+            message: `Student account has an unreconciled excess payment of ₹${(existingExcess / 100).toLocaleString('en-IN')}. Further ordinary payments are blocked until reconciled or explicitly authorized.`,
+            outstandingMinor: 0,
+            excessMinor: existingExcess,
+            isOverpaid: true,
+          },
+          { status: 400 },
+        );
+      }
+
+      if (amountMinor > currentOutstanding && !allowExcess) {
+        const excessAmt = amountMinor - currentOutstanding;
+        return NextResponse.json(
+          {
+            error: 'overpayment_not_permitted',
+            message: `Payment amount of ₹${(amountMinor / 100).toLocaleString('en-IN')} exceeds the outstanding balance of ₹${(currentOutstanding / 100).toLocaleString('en-IN')} by ₹${(excessAmt / 100).toLocaleString('en-IN')}. Overpayments require explicit authorization.`,
+            outstandingMinor: currentOutstanding,
+            excessMinor: excessAmt,
+            isOverpaid: false,
+          },
+          { status: 400 },
+        );
+      }
+
       const newPaid = currentPaid + amountMinor;
+      const newOutstanding = Math.max(0, currentNet - newPaid);
+      const newExcess = Math.max(0, newPaid - currentNet);
+
       student.paid_minor = String(newPaid);
-      student.outstanding_minor = String(Math.max(0, currentNet - newPaid));
+      student.outstanding_minor = String(newOutstanding);
+      (student as any).excess_minor = String(newExcess);
+      (student as any).is_overpaid = newExcess > 0;
 
       const paymentId = 'PAY-' + Math.floor(1000 + Math.random() * 9000);
       const receiptId = 'REC-' + Math.floor(1000 + Math.random() * 9000);
@@ -1751,11 +1628,64 @@ async function handle(req: NextRequest, { params }: { params: Promise<{ route: s
       if (!STUDENT_CUSTOM_RECEIPTS[student.id]) STUDENT_CUSTOM_RECEIPTS[student.id] = [];
       STUDENT_CUSTOM_RECEIPTS[student.id]!.unshift(receiptRecord);
 
+      // Also record on verified ledger in student-ledger
+      recordStudentPayment({
+        studentQuery: student.id,
+        amountMinor,
+        paymentMode: mode,
+        transactionId: paymentRecord.provider_reference,
+        outcome: 'successful',
+        allowExcess,
+      });
+
       return NextResponse.json({
         ok: true,
         paymentId,
         receiptId,
-        message: 'Payment recorded and receipt issued successfully',
+        message: newExcess > 0
+          ? `Payment recorded with excess credit balance of ₹${(newExcess / 100).toLocaleString('en-IN')}`
+          : 'Payment recorded and receipt issued successfully',
+        outstandingMinor: newOutstanding,
+        excessMinor: newExcess,
+        isOverpaid: newExcess > 0,
+      });
+    }
+
+    if (action === 'reconcile' && method === 'POST') {
+      let body: any = {};
+      try {
+        body = await req.json();
+      } catch {}
+      const reconcileAction = (body.action || 'refund') as 'refund' | 'credit_carry_forward' | 'fee_adjustment';
+      const result = reconcileStudentExcess({
+        studentQuery: student.id,
+        action: reconcileAction,
+        amountMinor: body.amountMinor,
+        reason: body.reason,
+      });
+
+      if (!result.success) {
+        return NextResponse.json({ error: result.message }, { status: 400 });
+      }
+
+      if (result.account) {
+        student.net_payable_minor = String(result.account.netPayableMinor);
+        student.paid_minor = String(result.account.paidMinor);
+        student.outstanding_minor = String(result.account.outstandingMinor);
+        (student as any).excess_minor = String(result.account.excessMinor || 0);
+        (student as any).is_overpaid = (result.account.excessMinor || 0) > 0;
+      }
+
+      return NextResponse.json({
+        ok: true,
+        message: result.message,
+        summary: {
+          net_payable_minor: student.net_payable_minor,
+          paid_minor: student.paid_minor,
+          outstanding_minor: student.outstanding_minor,
+          excess_minor: (student as any).excess_minor,
+          is_overpaid: (student as any).is_overpaid,
+        },
       });
     }
 
@@ -1905,6 +1835,12 @@ async function handle(req: NextRequest, { params }: { params: Promise<{ route: s
       });
     }
 
+    const netMinor = Number(student.net_payable_minor || 12000000);
+    const paidMinor = Number(student.paid_minor || 0);
+    const outMinor = Math.max(0, netMinor - paidMinor);
+    const excessMinor = Math.max(0, paidMinor - netMinor);
+    const isOverpaid = excessMinor > 0;
+
     return NextResponse.json({
       id: studentId,
       full_name: student.full_name,
@@ -1918,34 +1854,39 @@ async function handle(req: NextRequest, { params }: { params: Promise<{ route: s
       campus: (student as any).campus || 'Delhi Main Campus',
       email: (student as any).email || 'student@example.com',
       phone: (student as any).phone || '+91 98765 43210',
-      guardian_name: (student as any).guardian_name || 'Rajesh Sharma',
-      guardian_email: (student as any).guardian_email || 'rajesh.sharma@example.com',
-      guardian_phone: (student as any).guardian_phone || '+91 98765 43210',
+      guardian_name: (student as any).guardian_name || '-',
+      guardian_email: (student as any).guardian_email || '-',
+      guardian_phone: (student as any).guardian_phone || '-',
       enach_status: student.enach_status || 'active',
       summary: {
-        net_payable_minor: student.net_payable_minor || '12000000',
-        paid_minor: student.paid_minor || '6000000',
-        outstanding_minor: student.outstanding_minor || '6000000',
+        net_payable_minor: String(netMinor),
+        paid_minor: String(paidMinor),
+        outstanding_minor: String(outMinor),
+        excess_minor: String(excessMinor),
+        is_overpaid: isOverpaid,
       },
       balances: [
         {
           schedule_id: 'sch-' + student.id,
           account_reference: student.student_reference,
-          net_payable_minor: student.net_payable_minor || '12000000',
-          paid_minor: student.paid_minor || '6000000',
-          outstanding_minor: student.outstanding_minor || '6000000',
+          net_payable_minor: String(netMinor),
+          paid_minor: String(paidMinor),
+          outstanding_minor: String(outMinor),
+          excess_minor: String(excessMinor),
+          is_overpaid: isOverpaid,
         },
       ],
     });
   }
 
   if (path === 'admin/academic/students' || path === 'admin/fees/students') {
-    return NextResponse.json({
-      rows: DEMO_STUDENTS,
-      total: DEMO_STUDENTS.length,
-      page: 1,
-      pageSize: 20,
-    });
+    const search = req.nextUrl.searchParams.get('search') || '';
+    const status = req.nextUrl.searchParams.get('status') || 'all';
+    const sort = req.nextUrl.searchParams.get('sort') || 'name';
+    const page = req.nextUrl.searchParams.get('page') || '1';
+    const pageSize = req.nextUrl.searchParams.get('pageSize') || '25';
+    const result = getFilteredStudents({ search, status, sort, page, pageSize });
+    return NextResponse.json(result);
   }
 
   if (path === 'admin/academic/guardians' && method === 'POST') {
@@ -2026,6 +1967,22 @@ async function handle(req: NextRequest, { params }: { params: Promise<{ route: s
 
   // 3. Groups / Classes catalogue
   if (path === 'admin/academic/overview') {
+    const currentRoster = getStudentRoster();
+    const existingIds = new Set(DEMO_ACADEMIC_OVERVIEW.students.map((s) => s.id));
+    for (const st of currentRoster) {
+      if (!existingIds.has(st.id)) {
+        DEMO_ACADEMIC_OVERVIEW.students.push({
+          id: st.id,
+          student_reference: st.student_reference,
+          full_name: st.full_name,
+          date_of_birth: '2010-01-01',
+          status: st.status || 'active',
+          branch_code: 'DEL-MAIN',
+          branch_name: 'Delhi Main Campus',
+          academic_year: st.academic_year || '2026-27',
+        });
+      }
+    }
     return NextResponse.json(DEMO_ACADEMIC_OVERVIEW);
   }
 
@@ -3137,7 +3094,65 @@ async function handle(req: NextRequest, { params }: { params: Promise<{ route: s
   }
 
   if (path.includes('/payer-link')) {
-    const rawToken = 'demo-access-token-12345';
+    const parts = path.split('/');
+    const schedIdx = parts.indexOf('schedules');
+    const schedId = (schedIdx >= 0 && parts[schedIdx + 1] ? parts[schedIdx + 1]! : '').trim();
+    const sched = DEMO_SCHEDULES.find((s) => s.id === schedId || s.account_reference === schedId);
+    const cleanStudentId = schedId.startsWith('sch-') ? schedId.slice(4) : schedId;
+    const student =
+      findRosterStudent(schedId) ||
+      findRosterStudent(cleanStudentId) ||
+      DEMO_STUDENTS.find(
+        (s) =>
+          s.id === schedId ||
+          s.id === cleanStudentId ||
+          s.student_reference.toLowerCase() === schedId.toLowerCase() ||
+          s.student_reference.toLowerCase() === cleanStudentId.toLowerCase() ||
+          (sched && (s.student_reference === sched.account_reference || s.id === sched.payer_id || s.id === sched.id)),
+      );
+
+    if (!student && !sched) {
+      return NextResponse.json(
+        { error: 'Cannot generate payer link: student or schedule not found' },
+        { status: 404 },
+      );
+    }
+
+    const resolvedStudent = student || {
+      id: sched?.payer_id || schedId,
+      full_name: 'Authorized Student',
+      student_reference: sched?.account_reference || 'REF-' + schedId,
+      guardian_name: '-',
+      guardian_email: 'guardian@example.com',
+      guardian_phone: '+91 98765 43210',
+      net_payable_minor: '12000000',
+      paid_minor: '0',
+      outstanding_minor: '12000000',
+    };
+
+    const netPayableMinor = Number(resolvedStudent.net_payable_minor || 12000000);
+    const paidMinor = Number(resolvedStudent.paid_minor || 0);
+    const outstandingMinor = Number(resolvedStudent.outstanding_minor || (netPayableMinor - paidMinor));
+
+    const rawToken = 'sec-tok-' + randomBytes(16).toString('hex');
+    registerSecurePayerToken(rawToken, {
+      token: rawToken,
+      studentId: resolvedStudent.id,
+      studentName: resolvedStudent.full_name,
+      guardianName: (resolvedStudent as any).guardian_name || '-',
+      accountReference: resolvedStudent.student_reference,
+      email: (resolvedStudent as any).guardian_email || (resolvedStudent as any).email || 'guardian@example.com',
+      phone: (resolvedStudent as any).guardian_phone || (resolvedStudent as any).phone || '+91 98765 43210',
+      netPayableMinor,
+      paidMinor,
+      outstandingMinor,
+      expiresAt: Date.now() + 24 * 60 * 60 * 1000,
+      paymentMode: 'flexible',
+      allowCustomAmount: true,
+      allowComponentSelection: true,
+      minAmountMinor: 100000,
+    });
+
     return NextResponse.json({
       path: '/payer/' + rawToken + '/',
       expiresHours: 24,
@@ -3194,26 +3209,129 @@ async function handle(req: NextRequest, { params }: { params: Promise<{ route: s
       body = await req.json();
     } catch {}
     const amountMinor = Number(body.amountMinor || 2000000);
-    const student = DEMO_STUDENTS[0]!;
-    student.paid_minor = String(Number(student.paid_minor || 0) + amountMinor);
-    student.outstanding_minor = String(
-      Math.max(0, Number(student.net_payable_minor || 12000000) - Number(student.paid_minor)),
-    );
+    const allowExcess = Boolean(body.allowExcess || body.allowOverpayment);
+    const targetRef = (body.studentId || body.accountReference || '').trim();
+    const student = DEMO_STUDENTS.find(
+      (s) =>
+        (targetRef && (
+          s.id.toLowerCase() === targetRef.toLowerCase() ||
+          s.student_reference.toLowerCase() === targetRef.toLowerCase() ||
+          ((s as any).enrollment_id && (s as any).enrollment_id.toLowerCase() === targetRef.toLowerCase()) ||
+          s.full_name.toLowerCase() === targetRef.toLowerCase()
+        )),
+    ) || DEMO_STUDENTS[0]!;
+
+    const providerRef = (body.providerReference || body.transactionId || '').trim();
+    if (providerRef) {
+      const existing = (STUDENT_CUSTOM_PAYMENTS[student.id] || []).find(
+        (p: any) => p.provider_reference === providerRef || p.transactionId === providerRef,
+      );
+      if (existing) {
+        return NextResponse.json({
+          ok: true,
+          id: existing.id,
+          paymentId: existing.id,
+          receiptId: existing.receiptNumber || existing.receipt_number,
+          message: 'Payment already recorded (idempotent)',
+        });
+      }
+    }
+
+    const currentPaid = Number(student.paid_minor || 0);
+    const netMinor = Number(student.net_payable_minor || 12000000);
+    const currentOutstanding = Math.max(0, netMinor - currentPaid);
+    const existingExcess = Math.max(0, currentPaid - netMinor);
+
+    // Validate overpayments:
+    if (existingExcess > 0 && !allowExcess) {
+      return NextResponse.json(
+        {
+          error: 'overpayment_blocked',
+          message: `Student account has an unreconciled excess payment of ₹${(existingExcess / 100).toLocaleString('en-IN')}. Further ordinary payments are blocked until reconciled or explicitly authorized.`,
+          outstandingMinor: 0,
+          excessMinor: existingExcess,
+          isOverpaid: true,
+        },
+        { status: 400 },
+      );
+    }
+
+    if (amountMinor > currentOutstanding && !allowExcess) {
+      const excessAmt = amountMinor - currentOutstanding;
+      return NextResponse.json(
+        {
+          error: 'overpayment_not_permitted',
+          message: `Payment amount of ₹${(amountMinor / 100).toLocaleString('en-IN')} exceeds the outstanding balance of ₹${(currentOutstanding / 100).toLocaleString('en-IN')} by ₹${(excessAmt / 100).toLocaleString('en-IN')}. Overpayments require explicit authorization.`,
+          outstandingMinor: currentOutstanding,
+          excessMinor: excessAmt,
+          isOverpaid: false,
+        },
+        { status: 400 },
+      );
+    }
+
+    const newPaid = currentPaid + amountMinor;
+    const newOutstanding = Math.max(0, netMinor - newPaid);
+    const newExcess = Math.max(0, newPaid - netMinor);
+
+    student.paid_minor = String(newPaid);
+    student.outstanding_minor = String(newOutstanding);
+    (student as any).excess_minor = String(newExcess);
+    (student as any).is_overpaid = newExcess > 0;
+
+    if (STUDENT_PROFILES[student.student_reference]) {
+      STUDENT_PROFILES[student.student_reference]!.paidMinor = newPaid;
+      STUDENT_PROFILES[student.student_reference]!.outstandingMinor = newOutstanding;
+    }
+
     const paymentId = 'PAY-' + Math.floor(1000 + Math.random() * 9000);
-    const receiptId = 'REC-' + Math.floor(1000 + Math.random() * 9000);
+    const receiptNumber = body.receiptNumber || ('DPS-REC-2026-' + student.student_reference.replace(/[^0-9]/g, '') + '-' + String(100 + ((STUDENT_CUSTOM_PAYMENTS[student.id]?.length || 0) + 1)));
+    const nowIso = new Date().toISOString();
+
+    recordStudentPayment({
+      studentQuery: student.id,
+      amountMinor,
+      transactionId: providerRef || paymentId,
+      receiptNumber,
+      paymentMode: 'DIRECT',
+      outcome: 'successful',
+      allowExcess,
+    });
+
     if (!STUDENT_CUSTOM_PAYMENTS[student.id]) STUDENT_CUSTOM_PAYMENTS[student.id] = [];
     STUDENT_CUSTOM_PAYMENTS[student.id]!.unshift({
       id: paymentId,
+      transactionId: providerRef || paymentId,
       amount_minor: String(amountMinor),
-      recorded_at: new Date().toISOString(),
-      provider_reference: body.providerReference || `DIR-${Date.now().toString().slice(-6)}`,
-      status: 'Direct (Offline)',
+      amountMinor,
+      recorded_at: nowIso,
+      recordedAt: nowIso,
+      provider_reference: providerRef || `DIR-${Date.now().toString().slice(-6)}`,
+      status: 'confirmed',
+      receipt_number: receiptNumber,
+      receiptNumber,
+      mode: body.directPayment?.mode || 'Direct',
+      installmentId: body.installmentId || 'inst-1',
     });
+
+    if (!STUDENT_CUSTOM_RECEIPTS[student.id]) STUDENT_CUSTOM_RECEIPTS[student.id] = [];
+    STUDENT_CUSTOM_RECEIPTS[student.id]!.unshift({
+      id: receiptNumber,
+      receipt_number: receiptNumber,
+      receiptNumber,
+      issued_at: nowIso,
+      recordedAt: nowIso,
+      amountMinor,
+      remainingMinor: newOutstanding,
+      studentName: student.full_name,
+      accountReference: student.student_reference,
+    });
+
     return NextResponse.json({
       ok: true,
       id: paymentId,
       paymentId,
-      receiptId,
+      receiptId: receiptNumber,
       message: 'Payment recorded and balance updated',
     });
   }
@@ -3226,77 +3344,192 @@ async function handle(req: NextRequest, { params }: { params: Promise<{ route: s
     try {
       body = await req.json();
     } catch {}
-    const studentRef = body.studentReference || 'DPS-2026-089';
+    const studentRef = (body.studentReference || '').trim();
+    const accessCode = (body.identifier || '').trim();
+
+    if (!studentRef && !accessCode) {
+      return NextResponse.json(
+        { error: 'Student reference or access code is required' },
+        { status: 400 },
+      );
+    }
+
+    // Look up existing student by reference, id, enrollment_id or registered token
+    let student = DEMO_STUDENTS.find(
+      (s) =>
+        (studentRef && (
+          s.student_reference.toLowerCase() === studentRef.toLowerCase() ||
+          s.id.toLowerCase() === studentRef.toLowerCase() ||
+          ((s as any).enrollment_id && (s as any).enrollment_id.toLowerCase() === studentRef.toLowerCase()) ||
+          s.full_name.toLowerCase() === studentRef.toLowerCase()
+        )),
+    );
+
+    if (!student && accessCode) {
+      const reg = getRegisteredSecureToken(accessCode);
+      if (reg) {
+        student = DEMO_STUDENTS.find(
+          (s) =>
+            s.id.toLowerCase() === reg.studentId.toLowerCase() ||
+            s.student_reference.toLowerCase() === reg.accountReference.toLowerCase() ||
+            ((s as any).enrollment_id && (s as any).enrollment_id.toLowerCase() === reg.accountReference.toLowerCase()),
+        );
+      }
+    }
+
+    if (accessCode) {
+      const reg = getRegisteredSecureToken(accessCode);
+      if (
+        reg &&
+        student &&
+        reg.studentId.toLowerCase() !== student.id.toLowerCase() &&
+        reg.accountReference.toLowerCase() !== student.student_reference.toLowerCase()
+      ) {
+        return NextResponse.json(
+          { error: 'Access code is not valid for this student fee account' },
+          { status: 401 },
+        );
+      }
+    }
+
+    if (!student) {
+      return NextResponse.json(
+        { error: 'Student fee account not found' },
+        { status: 404 },
+      );
+    }
+
+    const payload = JSON.stringify({
+      ref: student.student_reference,
+      id: student.id,
+      code: accessCode,
+    });
     return NextResponse.json({
       ok: true,
-      token: 'portal-auth-jwt-' + Buffer.from(studentRef).toString('base64'),
+      token: 'portal-auth-' + Buffer.from(payload).toString('base64url'),
     });
   }
 
   if (path === 'portal/me') {
+    const authHeader = req.headers.get('authorization') || '';
+    if (!authHeader.startsWith('Bearer ')) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+    const raw = authHeader.slice(7).trim();
+    let targetRef = '';
+    let targetId = '';
+    try {
+      if (raw.startsWith('portal-auth-')) {
+        const jsonStr = Buffer.from(raw.slice(12), 'base64url').toString('utf8');
+        const parsed = JSON.parse(jsonStr);
+        if (parsed.ref) targetRef = parsed.ref;
+        if (parsed.id) targetId = parsed.id;
+      } else if (raw.startsWith('portal-auth-jwt-')) {
+        const decoded = Buffer.from(raw.slice(16), 'base64').toString('utf8');
+        if (decoded) targetRef = decoded;
+      }
+    } catch {}
+
+    if (!targetRef && !targetId) {
+      return NextResponse.json({ error: 'Invalid or expired portal token' }, { status: 401 });
+    }
+
+    const student = DEMO_STUDENTS.find(
+      (s) =>
+        (targetId && (
+          s.id.toLowerCase() === targetId.toLowerCase() ||
+          ((s as any).enrollment_id && (s as any).enrollment_id.toLowerCase() === targetId.toLowerCase())
+        )) ||
+        (targetRef && (
+          s.student_reference.toLowerCase() === targetRef.toLowerCase() ||
+          s.id.toLowerCase() === targetRef.toLowerCase() ||
+          ((s as any).enrollment_id && (s as any).enrollment_id.toLowerCase() === targetRef.toLowerCase()) ||
+          s.full_name.toLowerCase() === targetRef.toLowerCase()
+        )),
+    );
+
+    if (!student) {
+      return NextResponse.json({ error: 'Student fee account not found' }, { status: 404 });
+    }
+
+    const netMinor = Number(student.net_payable_minor) || 12000000;
+    const paidMinor = Number(student.paid_minor) || 0;
+    const outMinor = Math.max(0, netMinor - paidMinor);
+
+    const inst1Amount = Math.round(netMinor / 3);
+    const inst2Amount = Math.round(netMinor / 3);
+    const inst3Amount = netMinor - inst1Amount - inst2Amount;
+
+    const inst1Paid = Math.min(paidMinor, inst1Amount);
+    const inst2Paid = Math.min(Math.max(0, paidMinor - inst1Amount), inst2Amount);
+    const inst3Paid = Math.min(Math.max(0, paidMinor - inst1Amount - inst2Amount), inst3Amount);
+
     return NextResponse.json({
       student: {
-        id: 'stu-portal-1',
-        studentReference: 'DPS-2026-089',
-        fullName: 'V Rakesh',
-        email: 'rakesh.student@example.com',
-        phone: '+91 98765 43210',
-        status: 'active',
-        course: 'Senior Secondary Science',
-        grade: 'Grade 11-A',
-        groupName: 'Class 11 Science - Sec A',
-        academicYear: '2026-2027',
-        campus: 'Main Campus',
+        id: student.id,
+        studentReference: student.student_reference,
+        fullName: student.full_name,
+        email: student.email || `${student.student_reference.toLowerCase()}@example.com`,
+        phone: student.phone || '+91 98765 43210',
+        status: student.status || 'enrolled',
+        course: student.course || 'Senior Secondary Science',
+        grade: student.grade?.startsWith('Grade') ? student.grade : `Grade ${student.grade || '11-A'}`,
+        groupName: student.group_name || 'Class 11 Science - Sec A',
+        academicYear: student.academic_year || '2026-2027',
+        campus: student.campus || 'Main Campus',
+        payer_name: student.guardian_name || '-',
+        payer_email: student.guardian_email || 'payer@example.com',
+        payer_phone: student.guardian_phone || '+91 98765 43210',
       },
       institution: {
         id: 'inst-1',
-        name: 'Delhi Public School, R.K. Puram',
+        name: student.institute || 'Delhi Public School, R.K. Puram',
       },
       payer: {
-        name: 'Guardian / Linked Payer',
-        email: 'payer@example.com',
-        phone: '+91 98765 43210',
+        name: student.guardian_name || '-',
+        email: student.guardian_email || 'payer@example.com',
+        phone: student.guardian_phone || '+91 98765 43210',
       },
       summary: {
-        netPayableMinor: 12000000,
-        paidMinor: 4000000,
-        outstandingMinor: 8000000,
+        netPayableMinor: netMinor,
+        paidMinor: paidMinor,
+        outstandingMinor: outMinor,
       },
       feeComponents: [
-        { id: 'fc-1', label: 'Tuition Fee', code: 'TUIT', amountMinor: 8000000 },
-        { id: 'fc-2', label: 'Development & Lab Fee', code: 'DEV', amountMinor: 2500000 },
-        { id: 'fc-3', label: 'Activity & Sports Fee', code: 'ACT', amountMinor: 1500000 },
+        { id: 'fc-1', label: 'Tuition Fee', code: 'TUIT', amountMinor: Math.round(netMinor * 0.65) },
+        { id: 'fc-2', label: 'Development & Lab Fee', code: 'DEV', amountMinor: Math.round(netMinor * 0.2) },
+        { id: 'fc-3', label: 'Activity & Sports Fee', code: 'ACT', amountMinor: netMinor - Math.round(netMinor * 0.65) - Math.round(netMinor * 0.2) },
       ],
       installments: [
         {
           id: 'inst-1',
           sequence: 1,
           dueDate: '2026-07-10',
-          amountMinor: 4000000,
+          amountMinor: inst1Amount,
           adjustmentAmountMinor: 0,
-          paidAmountMinor: 4000000,
-          remainingMinor: 0,
-          status: 'paid',
+          paidAmountMinor: inst1Paid,
+          remainingMinor: Math.max(0, inst1Amount - inst1Paid),
+          status: inst1Paid >= inst1Amount ? 'paid' : inst1Paid > 0 ? 'part_paid' : 'pending',
         },
         {
           id: 'inst-2',
           sequence: 2,
           dueDate: '2026-10-25',
-          amountMinor: 4000000,
+          amountMinor: inst2Amount,
           adjustmentAmountMinor: 0,
-          paidAmountMinor: 0,
-          remainingMinor: 4000000,
-          status: 'pending',
+          paidAmountMinor: inst2Paid,
+          remainingMinor: Math.max(0, inst2Amount - inst2Paid),
+          status: inst2Paid >= inst2Amount ? 'paid' : inst2Paid > 0 ? 'part_paid' : 'pending',
         },
         {
           id: 'inst-3',
           sequence: 3,
           dueDate: '2027-01-15',
-          amountMinor: 4000000,
+          amountMinor: inst3Amount,
           adjustmentAmountMinor: 0,
-          paidAmountMinor: 0,
-          remainingMinor: 4000000,
-          status: 'pending',
+          paidAmountMinor: inst3Paid,
+          remainingMinor: Math.max(0, inst3Amount - inst3Paid),
+          status: inst3Paid >= inst3Amount ? 'paid' : inst3Paid > 0 ? 'part_paid' : 'pending',
         },
       ],
       masterSchedule: [
@@ -3304,55 +3537,68 @@ async function handle(req: NextRequest, { params }: { params: Promise<{ route: s
           id: 'ms-1',
           sequence: 1,
           dueDate: '2026-07-10',
-          amountMinor: 4000000,
+          amountMinor: inst1Amount,
           adjustmentAmountMinor: 0,
-          paidAmountMinor: 4000000,
-          remainingMinor: 0,
-          status: 'paid',
+          paidAmountMinor: inst1Paid,
+          remainingMinor: Math.max(0, inst1Amount - inst1Paid),
+          status: inst1Paid >= inst1Amount ? 'paid' : inst1Paid > 0 ? 'part_paid' : 'pending',
         },
         {
           id: 'ms-2',
           sequence: 2,
           dueDate: '2026-10-25',
-          amountMinor: 4000000,
+          amountMinor: inst2Amount,
           adjustmentAmountMinor: 0,
-          paidAmountMinor: 0,
-          remainingMinor: 4000000,
-          status: 'pending',
+          paidAmountMinor: inst2Paid,
+          remainingMinor: Math.max(0, inst2Amount - inst2Paid),
+          status: inst2Paid >= inst2Amount ? 'paid' : inst2Paid > 0 ? 'part_paid' : 'pending',
         },
         {
           id: 'ms-3',
           sequence: 3,
           dueDate: '2027-01-15',
-          amountMinor: 4000000,
+          amountMinor: inst3Amount,
           adjustmentAmountMinor: 0,
-          paidAmountMinor: 0,
-          remainingMinor: 4000000,
-          status: 'pending',
+          paidAmountMinor: inst3Paid,
+          remainingMinor: Math.max(0, inst3Amount - inst3Paid),
+          status: inst3Paid >= inst3Amount ? 'paid' : inst3Paid > 0 ? 'part_paid' : 'pending',
         },
       ],
       enach: {
-        mandateId: 'mndt-sandbox-1',
-        mandateReference: 'ENACH-MNDT-2026-8819',
+        mandateId: student.enach_status === 'active' ? 'mndt-sandbox-' + student.id : undefined,
+        mandateReference: 'ENACH-MNDT-' + student.student_reference,
         provider: 'sandbox_enach',
-        status: 'active',
-        upcomingDebit: {
-          amountMinor: 4000000,
+        status: student.enach_status || 'active',
+        upcomingDebit: outMinor > 0 ? {
+          amountMinor: inst2Paid < inst2Amount ? inst2Amount - inst2Paid : inst3Amount - inst3Paid,
           scheduledDate: '2026-10-25',
-        },
+        } : undefined,
       },
-      transactions: [
-        {
-          id: 'pay-rec-1',
-          transactionId: 'TXN-2026-0708-9921',
-          amountMinor: 4000000,
-          refundedAmountMinor: 0,
-          recordedAt: '2026-07-08T10:30:00Z',
-          status: 'settled',
-          receiptNumber: 'DPS-REC-2026-00412',
-          mode: 'eNACH Auto-debit',
-        },
-      ],
+      transactions: (STUDENT_CUSTOM_PAYMENTS[student.id] && STUDENT_CUSTOM_PAYMENTS[student.id]!.length > 0)
+        ? STUDENT_CUSTOM_PAYMENTS[student.id]!.map((p: any) => ({
+            id: p.id,
+            installmentId: p.installmentId || 'inst-1',
+            transactionId: p.transactionId || p.provider_reference || p.id,
+            amountMinor: Number(p.amountMinor || p.amount_minor),
+            refundedAmountMinor: 0,
+            recordedAt: p.recordedAt || p.recorded_at || new Date().toISOString(),
+            status: p.status || 'settled',
+            receiptNumber: p.receiptNumber || p.receipt_number || `${student.student_reference}-REC-001`,
+            mode: p.mode || 'eNACH Auto-Debit',
+          }))
+        : (paidMinor > 0 ? [
+            {
+              id: 'pay-rec-' + student.id,
+              installmentId: 'inst-1',
+              transactionId: 'TXN-SANDBOX-' + student.student_reference,
+              amountMinor: paidMinor,
+              refundedAmountMinor: 0,
+              recordedAt: '2026-07-08T10:30:00Z',
+              status: 'settled',
+              receiptNumber: `${student.student_reference}-REC-001`,
+              mode: 'eNACH Auto-Debit',
+            },
+          ] : []),
     });
   }
 
@@ -3412,39 +3658,181 @@ async function handle(req: NextRequest, { params }: { params: Promise<{ route: s
     try {
       body = await req.json();
     } catch {}
+
+    const authHeader = req.headers.get('authorization') || '';
+    let targetRef = (body.studentReference || body.accountReference || '').trim();
+    let targetId = (body.studentId || '').trim();
+
+    if (authHeader.startsWith('Bearer ')) {
+      const raw = authHeader.slice(7).trim();
+      try {
+        if (raw.startsWith('portal-auth-')) {
+          const jsonStr = Buffer.from(raw.slice(12), 'base64url').toString('utf8');
+          const parsed = JSON.parse(jsonStr);
+          if (parsed.ref) targetRef = parsed.ref;
+          if (parsed.id) targetId = parsed.id;
+        } else if (raw.startsWith('portal-auth-jwt-')) {
+          const decoded = Buffer.from(raw.slice(16), 'base64').toString('utf8');
+          if (decoded) targetRef = decoded;
+        }
+      } catch {}
+    }
+
+    const student = DEMO_STUDENTS.find(
+      (s) =>
+        (targetId && (
+          s.id.toLowerCase() === targetId.toLowerCase() ||
+          ((s as any).enrollment_id && (s as any).enrollment_id.toLowerCase() === targetId.toLowerCase())
+        )) ||
+        (targetRef && (
+          s.student_reference.toLowerCase() === targetRef.toLowerCase() ||
+          s.id.toLowerCase() === targetRef.toLowerCase() ||
+          ((s as any).enrollment_id && (s as any).enrollment_id.toLowerCase() === targetRef.toLowerCase()) ||
+          s.full_name.toLowerCase() === targetRef.toLowerCase()
+        )),
+    ) || DEMO_STUDENTS[0]!;
+
     if (body.outcome === 'failed') {
       return NextResponse.json({
         ok: true,
         message: 'Sandbox debit simulation failed as requested (insufficient funds simulation).',
       });
     }
+
+    const clientTxn = (body.transactionId || body.providerReference || body.idempotencyKey || '').trim();
+    if (clientTxn) {
+      const existing = (STUDENT_CUSTOM_PAYMENTS[student.id] || []).find(
+        (p: any) => p.transactionId === clientTxn || p.provider_reference === clientTxn || p.id === clientTxn,
+      );
+      if (existing) {
+        return NextResponse.json({
+          ok: true,
+          message: 'Payment already processed and verified (idempotent)',
+          paymentComplete: {
+            transactionId: existing.transactionId || clientTxn,
+            receiptNumber: existing.receiptNumber || existing.receipt_number,
+            amountMinor: Number(existing.amountMinor || existing.amount_minor),
+            paymentDate: existing.recordedAt || existing.recorded_at,
+            outstandingMinor: Number(student.outstanding_minor || 0),
+          },
+        });
+      }
+    }
+
+    const amountMinor = Number(body.amountMinor || 4000000);
+    const currentPaid = Number(student.paid_minor || 0);
+    const netMinor = Number(student.net_payable_minor || 12000000);
+    const newPaid = Math.min(netMinor, currentPaid + amountMinor);
+    student.paid_minor = String(newPaid);
+    const newOutstanding = Math.max(0, netMinor - newPaid);
+    student.outstanding_minor = String(newOutstanding);
+
+    if (STUDENT_PROFILES[student.student_reference]) {
+      STUDENT_PROFILES[student.student_reference]!.paidMinor = newPaid;
+      STUDENT_PROFILES[student.student_reference]!.outstandingMinor = newOutstanding;
+    }
+
+    const transactionId = clientTxn || ('TXN-SANDBOX-' + student.student_reference + '-' + Date.now().toString().slice(-6));
+    const receiptNumber = body.receiptNumber || ('DPS-REC-2026-' + student.student_reference.replace(/[^0-9]/g, '') + '-' + String(100 + ((STUDENT_CUSTOM_PAYMENTS[student.id]?.length || 0) + 1)));
+    const paymentMode = body.paymentMode || 'eNACH Auto-Debit';
+    const nowIso = new Date().toISOString();
+
+    recordStudentPayment({
+      studentQuery: student.id,
+      amountMinor,
+      transactionId,
+      receiptNumber,
+      paymentMode,
+      outcome: 'successful',
+    });
+
+    if (!STUDENT_CUSTOM_PAYMENTS[student.id]) STUDENT_CUSTOM_PAYMENTS[student.id] = [];
+    STUDENT_CUSTOM_PAYMENTS[student.id]!.unshift({
+      id: 'pay-' + transactionId,
+      transactionId,
+      provider_reference: transactionId,
+      amount_minor: String(amountMinor),
+      amountMinor,
+      recorded_at: nowIso,
+      recordedAt: nowIso,
+      status: 'confirmed',
+      receipt_number: receiptNumber,
+      receiptNumber,
+      mode: paymentMode,
+      installmentId: body.installmentId || 'inst-1',
+    });
+
+    if (!STUDENT_CUSTOM_RECEIPTS[student.id]) STUDENT_CUSTOM_RECEIPTS[student.id] = [];
+    STUDENT_CUSTOM_RECEIPTS[student.id]!.unshift({
+      id: 'rec-' + transactionId,
+      receipt_number: receiptNumber,
+      receiptNumber,
+      transactionId,
+      issued_at: nowIso,
+      recordedAt: nowIso,
+      amountMinor,
+      amount_minor: amountMinor,
+      remainingMinor: newOutstanding,
+      outstandingMinor: newOutstanding,
+      studentName: student.full_name,
+      accountReference: student.student_reference,
+      institute: student.institute,
+      mode: paymentMode,
+    });
+
     return NextResponse.json({
       ok: true,
       message: 'Sandbox debit simulated successfully',
       paymentComplete: {
-        transactionId: 'TXN-SANDBOX-' + Date.now(),
-        receiptNumber: 'DPS-REC-2026-' + Math.floor(10000 + Math.random() * 90000),
-        amountMinor: 4000000,
-        paymentDate: new Date().toISOString(),
-        outstandingMinor: 4000000,
+        transactionId,
+        receiptNumber,
+        amountMinor,
+        paymentDate: nowIso,
+        outstandingMinor: newOutstanding,
       },
     });
   }
 
   if (path.startsWith('portal/receipts/')) {
-    const rcpNum = path.split('/').pop() || 'DPS-REC-2026-00412';
+    const rcpNum = path.split('/').pop() || '';
+    const student =
+      DEMO_STUDENTS.find(
+        (s) =>
+          rcpNum.toUpperCase().includes(s.student_reference.toUpperCase()) ||
+          rcpNum.includes(s.student_reference.replace(/[^0-9]/g, '')),
+      ) || (rcpNum.includes('DPS-2026-089') || rcpNum === 'DPS-REC-2026-00412' ? DEMO_STUDENTS[0] : null);
+
+    if (!student) {
+      return NextResponse.json({ error: 'Receipt not found' }, { status: 404 });
+    }
+
+    const customReceipt = (STUDENT_CUSTOM_RECEIPTS[student.id] || []).find(
+      (r: any) => r.receipt_number === rcpNum || r.receiptNumber === rcpNum || r.id === rcpNum,
+    );
+    const customPayment = (STUDENT_CUSTOM_PAYMENTS[student.id] || []).find(
+      (p: any) => p.receiptNumber === rcpNum || p.receipt_number === rcpNum || p.transactionId === rcpNum || p.id === rcpNum,
+    );
+
+    const amountMinor = customReceipt?.amountMinor || (customPayment ? Number(customPayment.amountMinor || customPayment.amount_minor) : 4000000);
+    const remainingMinor = customReceipt?.remainingMinor !== undefined ? customReceipt.remainingMinor : Number(student.outstanding_minor || 0);
+    const txnId = customPayment?.transactionId || customReceipt?.transactionId || ('TXN-SANDBOX-' + rcpNum);
+    const recordedAt = customPayment?.recordedAt || customPayment?.recorded_at || customReceipt?.issued_at || new Date().toISOString();
+    const paymentMode = customPayment?.mode || 'Sandbox eNACH';
+
     return NextResponse.json({
       receipt_number: rcpNum,
-      institution_name: 'Delhi Public School, R.K. Puram',
-      recorded_at: new Date().toISOString(),
-      transaction_id: 'TXN-SANDBOX-' + rcpNum,
-      payment_mode: 'Sandbox eNACH',
-      amount_minor: 4000000,
+      institution_name: student.institute || 'Delhi Public School (Demo)',
+      recorded_at: recordedAt,
+      transaction_id: txnId,
+      payment_mode: paymentMode,
+      amount_minor: amountMinor,
+      remaining_minor: remainingMinor,
       snapshot: {
-        studentName: 'V Rakesh',
-        accountReference: 'DPS-2026-089',
-        instituteName: 'Delhi Public School, R.K. Puram',
-        amountMinor: 4000000,
+        studentName: student.full_name,
+        accountReference: student.student_reference,
+        instituteName: student.institute || 'Delhi Public School (Demo)',
+        amountMinor,
+        remainingMinor,
         receiptConfig: {
           heading: 'Official Payment Receipt',
           header_note: 'Verified electronic acknowledgement of fee collection.',

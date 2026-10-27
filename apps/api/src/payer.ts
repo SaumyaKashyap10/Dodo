@@ -231,7 +231,12 @@ export class PayerPortalController {
     const rows = await this.db.query(
       `SELECT t.schedule_id,t.payment_mode,t.allow_custom_amount,t.allow_component_selection,
               t.min_amount_minor,s.tenant_id,s.account_reference,s.currency,s.total_amount_minor,s.status,
-              p.id AS payer_id,p.encrypted_profile,p.active
+              p.id AS payer_id,p.encrypted_profile,p.active,
+              (SELECT ast.full_name
+               FROM student_fee_plan_assignments a
+               JOIN academic_students ast ON ast.id=a.student_id AND ast.tenant_id=a.tenant_id
+               WHERE a.tenant_id=s.tenant_id AND a.schedule_id=s.id
+               ORDER BY a.assigned_on DESC LIMIT 1) AS student_name
        FROM payer_access_tokens t
        JOIN fee_schedules s ON s.id=t.schedule_id
        JOIN fee_payers p ON p.id=s.payer_id
@@ -356,7 +361,11 @@ export class PayerPortalController {
     return {
       collectionMode: process.env.AUTOPAY_PROVIDER_MODE === 'sandbox' ? 'sandbox' : 'provider',
       summary,
-      payer: { displayName: profile.displayName, accountReference: access.account_reference },
+      payer: {
+        displayName: profile.displayName,
+        accountReference: access.account_reference,
+        studentName: access.student_name || null,
+      },
       schedule: {
         id: access.schedule_id,
         currency: access.currency,

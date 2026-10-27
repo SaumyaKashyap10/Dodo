@@ -20,6 +20,10 @@ import { CURRENT_PROVIDER_METRICS, type ProviderCapabilityMatrix } from '@/lib/e
 import {
   balanceEvenly,
   generateAutomatedSchedule,
+  recalculateScheduleDates,
+  getFrequencyCycleMonths,
+  calculateCoverageWindow,
+  calculateInstallmentDueDate,
   type FrequencyType,
 } from '@/lib/enach/installment-automator';
 
@@ -177,12 +181,20 @@ export function EnachDashboard({ openFeeOperations, initialView = 'overview', on
   const [setupEndDate, setSetupEndDate] = useState('2027-06-30');
   const [setupAuthMethod, setSetupAuthMethod] = useState<AuthMethod>('UPI App Intent (Simulated)');
   const [setupInstallments, setSetupInstallments] = useState<LinkedInstallment[]>([]);
+  const [hasCustomAmounts, setHasCustomAmounts] = useState(false);
   const [viewReceiptDebit, setViewReceiptDebit] = useState<SandboxDebitAttempt | null>(null);
 
   const updateInstallment = (idx: number, patch: Partial<LinkedInstallment>) => {
-    setSetupInstallments((prev) =>
-      prev.map((inst, i) => (i === idx ? ({ ...inst, ...patch } as LinkedInstallment) : inst))
-    );
+    if ('amount_minor' in patch) {
+      setHasCustomAmounts(true);
+    }
+    setSetupInstallments((prev) => {
+      const updated = prev.map((inst, i) => (i === idx ? ({ ...inst, ...patch } as LinkedInstallment) : inst));
+      if (idx === updated.length - 1 && patch.period_end) {
+        setSetupEndDate(patch.period_end);
+      }
+      return updated;
+    });
   };
 
   // Helper: Generates realistic scheduled instalments matching selected debit frequency
@@ -191,75 +203,70 @@ export function EnachDashboard({ openFeeOperations, initialView = 'overview', on
     totalMinor: number,
     studentId: string = 'stu',
     startDate?: string,
-    endDate?: string,
   ): { items: LinkedInstallment[]; startDate: string; endDate: string } => {
     return generateAutomatedSchedule({
       frequency: freq,
       totalMinor,
       studentId,
       startDate: startDate || setupStartDate,
-      endDate: endDate || setupEndDate,
     });
   };
 
-  // Handles dynamic frequency dropdown selection (Monthly, Bi-Monthly, Quarterly, Term-Wise, As Presented)
+  // Handles dynamic frequency dropdown selection (Quarterly: 4, 5 cycles: 5, 6 cycles: 6, 10 cycles: 10, Flexible)
   const handleFrequencyChange = (newFreq: FrequencyType) => {
     setSetupFrequency(newFreq);
+    setHasCustomAmounts(false);
     const student = studentMappings.find((s) => s.student_id === setupStudentId);
-    const remaining = student?.remaining_minor || 12000000;
+    const assignedFee = student ? (student.total_fee_minor || student.remaining_minor || 12000000) : 12000000;
     const { items, startDate, endDate } = generateAutomatedSchedule({
       frequency: newFreq,
-      totalMinor: remaining,
+      totalMinor: assignedFee,
+      startDate: setupStartDate,
       studentId: setupStudentId || 'stu',
     });
     setSetupInstallments(items);
     setSetupStartDate(startDate);
     setSetupEndDate(endDate);
-    if (items.length > 0 && items[0]) {
-      const perInst = items[0].amount_minor;
-      if (perInst > setupMaxAmountMinor) {
-        setSetupMaxAmountMinor(perInst);
-      }
-    }
   };
 
-  // Handles start date change and regenerates schedule within new boundaries
+  // Handles start date change and automatically recalculates all dependent coverage dates and mandate end date
   const handleStartDateChange = (newStart: string) => {
     setSetupStartDate(newStart);
     if (!newStart) return;
     const student = studentMappings.find((s) => s.student_id === setupStudentId);
-    const remaining = student?.remaining_minor || 12000000;
-    const { items } = generateAutomatedSchedule({
-      frequency: setupFrequency,
-      totalMinor: remaining,
-      startDate: newStart,
-      endDate: setupEndDate,
-      studentId: setupStudentId || 'stu',
-    });
-    setSetupInstallments(items);
+    const assignedFee = student ? (student.total_fee_minor || student.remaining_minor || 12000000) : 12000000;
+
+    if (hasCustomAmounts || setupFrequency === 'as_presented') {
+      const { items, endDate } = recalculateScheduleDates(
+        setupInstallments,
+        newStart,
+        setupFrequency,
+      );
+      setSetupInstallments(items);
+      setSetupEndDate(endDate);
+    } else {
+      const { items, endDate } = generateAutomatedSchedule({
+        frequency: setupFrequency,
+        totalMinor: assignedFee,
+        startDate: newStart,
+        studentId: setupStudentId || 'stu',
+      });
+      setSetupInstallments(items);
+      setSetupEndDate(endDate);
+    }
   };
 
-  // Handles end date change and regenerates schedule within new boundaries
+  // Handles end date change
   const handleEndDateChange = (newEnd: string) => {
     setSetupEndDate(newEnd);
-    if (!newEnd) return;
-    const student = studentMappings.find((s) => s.student_id === setupStudentId);
-    const remaining = student?.remaining_minor || 12000000;
-    const { items } = generateAutomatedSchedule({
-      frequency: setupFrequency,
-      totalMinor: remaining,
-      startDate: setupStartDate,
-      endDate: newEnd,
-      studentId: setupStudentId || 'stu',
-    });
-    setSetupInstallments(items);
   };
 
   // Increases instalments by adding a new scheduled period
   const handleAddInstallment = () => {
     const student = studentMappings.find((s) => s.student_id === setupStudentId);
-    const remaining = student?.remaining_minor || 12000000;
+    const assignedFee = student ? (student.total_fee_minor || student.remaining_minor || 12000000) : 12000000;
     const nextSeq = setupInstallments.length + 1;
+    const cycleMonths = getFrequencyCycleMonths(setupFrequency);
 
     let nextStart = '2026-07-01';
     let nextEnd = '2026-09-30';
@@ -268,23 +275,17 @@ export function EnachDashboard({ openFeeOperations, initialView = 'overview', on
     if (setupInstallments.length > 0) {
       const last = setupInstallments[setupInstallments.length - 1];
       if (last && last.period_end) {
-        const lastEndDate = new Date(last.period_end);
-        const nextStartDate = new Date(lastEndDate);
-        nextStartDate.setDate(nextStartDate.getDate() + 1);
-        nextStart = nextStartDate.toISOString().slice(0, 10);
-
-        const nextEndDate = new Date(nextStartDate);
-        nextEndDate.setMonth(nextEndDate.getMonth() + 2);
-        nextEnd = nextEndDate.toISOString().slice(0, 10);
-
-        const nextDueDate = new Date(nextStartDate);
-        nextDueDate.setDate(nextDueDate.getDate() + 10);
-        nextDue = nextDueDate.toISOString().slice(0, 10);
+        const [lY = 2026, lM = 7, lD = 1] = last.period_end.split('-').map(Number);
+        const nextStartDateObj = new Date(Date.UTC(lY, lM - 1, lD + 1));
+        nextStart = nextStartDateObj.toISOString().slice(0, 10);
+        const { period_end: nextCalculatedEnd } = calculateCoverageWindow(nextStart, 0, cycleMonths);
+        nextEnd = nextCalculatedEnd;
+        nextDue = calculateInstallmentDueDate(nextStart, nextEnd, 10);
       }
     }
 
     const currentTotal = setupInstallments.reduce((sum, inst) => sum + (inst.amount_minor || 0), 0);
-    const amountMinor = currentTotal < remaining ? remaining - currentTotal : Math.round(remaining / nextSeq);
+    const amountMinor = currentTotal < assignedFee ? assignedFee - currentTotal : Math.round(assignedFee / nextSeq);
 
     const newInst: LinkedInstallment = {
       id: `inst-${setupStudentId || 'stu'}-custom-${Date.now()}`,
@@ -326,14 +327,16 @@ export function EnachDashboard({ openFeeOperations, initialView = 'overview', on
     if (setupInstallments.length === 0) return;
     const student = studentMappings.find((s) => s.student_id === setupStudentId);
     const currentSum = setupInstallments.reduce((sum, inst) => sum + (inst.amount_minor || 0), 0);
-    const remaining =
-      student && student.remaining_minor > 0
-        ? student.remaining_minor
+    const assignedFee =
+      student && (student.total_fee_minor || student.remaining_minor)
+        ? (student.total_fee_minor || student.remaining_minor)
         : currentSum > 0
           ? currentSum
           : 12000000;
-    const balanced = balanceEvenly(setupInstallments, remaining);
+    const balanced = balanceEvenly(setupInstallments, assignedFee);
     setSetupInstallments(balanced);
+    setHasCustomAmounts(false);
+    showToast(`✓ Total fee of ₹${(assignedFee / 100).toLocaleString('en-IN')} balanced evenly across ${setupInstallments.length} instalments.`);
   };
 
   // Auto-populates setup form and linked instalments when a student is selected
@@ -359,8 +362,10 @@ export function EnachDashboard({ openFeeOperations, initialView = 'overview', on
       if (student.ifsc_code) {
         setSetupIfsc(student.ifsc_code);
       }
-      const remaining = student.remaining_minor || 12000000;
-      setSetupMaxAmountMinor(remaining ? Math.min(remaining, 5000000) : 5000000);
+      const remaining = student.remaining_minor || student.total_fee_minor || 12000000;
+      if (student.max_amount_minor) {
+        setSetupMaxAmountMinor(student.max_amount_minor);
+      }
 
       if (Array.isArray(student.installments) && student.installments.length > 0) {
         setSetupInstallments(student.installments);
@@ -487,6 +492,21 @@ export function EnachDashboard({ openFeeOperations, initialView = 'overview', on
       return;
     }
     const isUpi = setupPaymentMethod === 'upi_autopay';
+    if (!setupMaxAmountMinor || setupMaxAmountMinor <= 0) {
+      alert('Please enter a valid Maximum Mandate Debit Cap greater than ₹0.');
+      return;
+    }
+    if (isUpi && setupMaxAmountMinor > 10000000) {
+      alert('NPCI UPI AutoPay mandate limit cannot exceed ₹1,00,000 per recurring debit.');
+      return;
+    }
+    const exceedingInst = setupInstallments.find((inst) => inst.amount_minor > setupMaxAmountMinor);
+    if (exceedingInst) {
+      alert(
+        `Scheduled instalment "${exceedingInst.name}" (${formatMoney(exceedingInst.amount_minor)}) exceeds the maximum mandate debit cap (${formatMoney(setupMaxAmountMinor)}). Please increase the maximum debit cap in Step 3 or reduce/balance instalment amounts before proceeding.`
+      );
+      return;
+    }
     if (isUpi) {
       if (!setupPayerVpa || !/^[a-zA-Z0-9.\-_]{2,256}@[a-zA-Z]{2,64}$/.test(setupPayerVpa.trim())) {
         alert('Please enter a valid UPI ID / VPA (e.g. parent@okhdfcbank).');
@@ -1373,8 +1393,8 @@ export function EnachDashboard({ openFeeOperations, initialView = 'overview', on
                         setSetupInstallments(items);
                         setSetupStartDate(startDate);
                         setSetupEndDate(endDate);
-                        if (items.length > 0 && items[0]) {
-                          setSetupMaxAmountMinor(Math.max(5000000, items[0].amount_minor));
+                        if (selected.max_amount_minor) {
+                          setSetupMaxAmountMinor(selected.max_amount_minor);
                         }
                       }
                     }}
@@ -1584,10 +1604,10 @@ export function EnachDashboard({ openFeeOperations, initialView = 'overview', on
                         style={{ width: '100%', padding: '8px 10px', borderRadius: 6, border: '1px solid #cbd5e1', fontWeight: 600 }}
                       >
                         <option value="quarterly">Quarterly (4 cycles)</option>
-                        <option value="term_5">Term-Wise (5 cycles)</option>
-                        <option value="monthly">Monthly (10 cycles)</option>
-                        <option value="bi-monthly">Bi-Monthly (6 cycles)</option>
-                        <option value="as_presented">As Presented (Flexible)</option>
+                        <option value="term_5">5 instalments (Term-Wise)</option>
+                        <option value="bi-monthly">6 instalments (Bi-Monthly)</option>
+                        <option value="monthly">10 instalments (Monthly)</option>
+                        <option value="as_presented">Flexible / Custom (As Presented)</option>
                       </select>
                     </div>
                     <div>
@@ -1733,6 +1753,28 @@ export function EnachDashboard({ openFeeOperations, initialView = 'overview', on
                     </div>
                   ) : (
                     <>
+                      {setupInstallments.some((inst) => inst.amount_minor > setupMaxAmountMinor) && (
+                        <div
+                          style={{
+                            marginBottom: '1rem',
+                            padding: '12px 16px',
+                            background: '#fff1f2',
+                            border: '1px solid #fecdd3',
+                            borderRadius: 6,
+                            color: '#9f1239',
+                            fontSize: '13px',
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '10px',
+                          }}
+                        >
+                          <span style={{ fontSize: '18px', flexShrink: 0 }}>⚠️</span>
+                          <div>
+                            <strong>Mandate Cap Limit Exceeded:</strong> One or more scheduled instalment amounts exceed the maximum debit cap of {formatMoney(setupMaxAmountMinor)}. 
+                            Mandate submission is blocked until you raise the Maximum Mandate Cap in Step 3 or click &ldquo;⚖️ Balance Evenly&rdquo; / adjust instalment amounts below.
+                          </div>
+                        </div>
+                      )}
                       <div className="admin-table-wrap">
                         <table className="admin-table" style={{ margin: 0, minWidth: 960 }}>
                           <thead>
@@ -1895,8 +1937,20 @@ export function EnachDashboard({ openFeeOperations, initialView = 'overview', on
                   <button
                     type="submit"
                     className="button primary"
-                    style={{ background: '#0d9488', borderColor: '#0d9488', color: '#ffffff', fontWeight: 700, padding: '10px 24px' }}
-                    disabled={busy || !setupStudentId}
+                    style={{
+                      background: setupInstallments.some((inst) => inst.amount_minor > setupMaxAmountMinor) ? '#94a3b8' : '#0d9488',
+                      borderColor: setupInstallments.some((inst) => inst.amount_minor > setupMaxAmountMinor) ? '#94a3b8' : '#0d9488',
+                      color: '#ffffff',
+                      fontWeight: 700,
+                      padding: '10px 24px',
+                      cursor: setupInstallments.some((inst) => inst.amount_minor > setupMaxAmountMinor) ? 'not-allowed' : 'pointer',
+                    }}
+                    disabled={busy || !setupStudentId || setupInstallments.some((inst) => inst.amount_minor > setupMaxAmountMinor)}
+                    title={
+                      setupInstallments.some((inst) => inst.amount_minor > setupMaxAmountMinor)
+                        ? 'Cannot submit: one or more instalments exceed maximum mandate debit cap'
+                        : undefined
+                    }
                   >
                     {busy
                       ? 'Initiating…'

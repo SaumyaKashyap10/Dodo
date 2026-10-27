@@ -8,5 +8,5 @@ export default async function PortalPayerPage({
   params: Promise<{ token: string }>;
 }) {
   const { token } = await params;
-  redirect('/student/?token=' + encodeURIComponent(token));
+  redirect('/payer/' + encodeURIComponent(token) + '/');
 }

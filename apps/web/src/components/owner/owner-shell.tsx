@@ -7,7 +7,6 @@ import { useOwner } from './owner-context';
 import { OwnerOverview } from './owner-overview';
 import { OwnerInstitutions } from './owner-institutions';
 import { OwnerCommercials } from './owner-commercials';
-import { OwnerSubscriptions } from './owner-subscriptions';
 import { OwnerRevenue } from './owner-revenue';
 import { OwnerPaymentProviders } from './owner-payment-providers';
 import { OwnerSettings } from './owner-settings';

@@ -1,6 +1,7 @@
 import Link from 'next/link';
 import { notFound } from 'next/navigation';
 import { ReceiptPrint } from '@/components/receipt-print';
+import { getDemoPayerData } from '@/lib/payer-store';
 
 export const dynamic = 'force-dynamic';
 export const metadata = {
@@ -13,16 +14,18 @@ export default async function Receipt({
   params: Promise<{ token: string; receiptNumber: string }>;
 }) {
   const { token, receiptNumber } = await params;
-  if (!token || !receiptNumber) notFound();
+  const cleanToken = decodeURIComponent(token || '').replace(/\/+$/, '').trim();
+  const cleanReceipt = decodeURIComponent(receiptNumber || '').trim();
+  if (!cleanToken || !cleanReceipt) notFound();
 
   let receipt: any = null;
   try {
     const response = await fetch(
       (process.env.API_INTERNAL_URL || 'http://127.0.0.1:4000') +
         '/v1/payer/' +
-        encodeURIComponent(token) +
+        encodeURIComponent(cleanToken) +
         '/receipts/' +
-        encodeURIComponent(receiptNumber),
+        encodeURIComponent(cleanReceipt),
       { cache: 'no-store', signal: AbortSignal.timeout(3000) },
     );
     if (response.ok) {
@@ -31,17 +34,23 @@ export default async function Receipt({
   } catch {}
 
   if (!receipt) {
+    const payerData = getDemoPayerData(cleanToken);
+    const stuName = payerData?.payer?.studentName || 'Authorized Student';
+    const guardianName = payerData?.payer?.displayName || 'Authorized Payer';
+    const accRef = payerData?.payer?.accountReference || 'DPS-2026-089';
+
     receipt = {
-      receipt_number: receiptNumber,
+      receipt_number: cleanReceipt,
       issued_at: new Date().toISOString(),
       snapshot: {
-        studentName: 'V Rakesh',
-        instituteName: 'Delhi Public School, R.K. Puram',
-        accountReference: 'DPS-2026-089',
+        studentName: stuName,
+        guardianName,
+        instituteName: 'Delhi Public School (Demo)',
+        accountReference: accRef,
         amountMinor: 4000000,
-        occurredAt: '2026-07-08T10:30:00Z',
+        occurredAt: new Date().toISOString(),
         provider: 'sandbox_enach',
-        providerReference: 'TXN-SANDBOX-' + receiptNumber,
+        providerReference: 'TXN-SANDBOX-' + cleanReceipt,
         notes: 'Tuition and academic fees installment payment (verified)',
         receiptConfig: {
           heading: 'Official Payment Receipt',
@@ -53,7 +62,7 @@ export default async function Receipt({
         },
         directPayment: {
           mode: 'UPI / NetBanking',
-          transactionDate: '2026-07-08T10:30:00Z',
+          transactionDate: new Date().toISOString(),
         },
       },
     };
@@ -86,6 +95,16 @@ export default async function Receipt({
     ],
     ['Payment mode', snapshot.directPayment?.mode || snapshot.provider || 'External payment'],
     ['Reference', snapshot.providerReference],
+    ...(snapshot.remainingMinor !== undefined || receipt.remaining_minor !== undefined
+      ? [
+          [
+            'Remaining balance',
+            new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR' }).format(
+              Number(snapshot.remainingMinor !== undefined ? snapshot.remainingMinor : receipt.remaining_minor) / 100,
+            ),
+          ],
+        ]
+      : []),
     ['Notes', snapshot.notes || '—'],
   ];
   return (
@@ -118,7 +137,7 @@ export default async function Receipt({
           {snapshot.receiptConfig?.terms_and_conditions || snapshot.receiptConfig?.terms}
         </small>
       </section>
-      <Link className="no-print" href={'/payer/' + encodeURIComponent(token) + '/'}>
+      <Link className="no-print" href={'/payer/' + encodeURIComponent(cleanToken) + '/'}>
         Back to fee account
       </Link>
     </main>

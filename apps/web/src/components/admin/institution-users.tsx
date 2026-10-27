@@ -287,17 +287,26 @@ export function InstitutionUsers() {
             <p className="small">Try adjusting your search criteria or role filters.</p>
           </div>
         ) : (
-          <div className="admin-table-wrap">
-            <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: 'var(--text-sm)' }}>
+          <div className="admin-table-wrap" style={{ overflowX: 'auto', WebkitOverflowScrolling: 'touch' }}>
+            <table
+              className="admin-table"
+              style={{
+                width: '100%',
+                minWidth: '900px',
+                borderCollapse: 'collapse',
+                textAlign: 'left',
+                fontSize: 'var(--text-sm)',
+              }}
+            >
               <thead>
                 <tr style={{ background: '#f8fafc', borderBottom: '1px solid var(--surface-border)' }}>
-                  <th style={{ padding: '12px 16px', fontWeight: 600 }}>Staff Name</th>
-                  <th style={{ padding: '12px 16px', fontWeight: 600 }}>Email Address</th>
-                  <th style={{ padding: '12px 16px', fontWeight: 600 }}>Institution Role</th>
-                  <th style={{ padding: '12px 16px', fontWeight: 600 }}>Assigned Branch</th>
-                  <th style={{ padding: '12px 16px', fontWeight: 600 }}>Account Status</th>
-                  <th style={{ padding: '12px 16px', fontWeight: 600 }}>Last Login</th>
-                  <th style={{ padding: '12px 16px', fontWeight: 600, textAlign: 'right' }}>Actions</th>
+                  <th style={{ padding: '12px 16px', fontWeight: 600, whiteSpace: 'nowrap', minWidth: '160px' }}>Staff Name</th>
+                  <th style={{ padding: '12px 16px', fontWeight: 600, whiteSpace: 'nowrap', minWidth: '200px' }}>Email Address</th>
+                  <th style={{ padding: '12px 16px', fontWeight: 600, whiteSpace: 'nowrap', minWidth: '150px' }}>Institution Role</th>
+                  <th style={{ padding: '12px 16px', fontWeight: 600, whiteSpace: 'nowrap', minWidth: '140px' }}>Assigned Branch</th>
+                  <th style={{ padding: '12px 16px', fontWeight: 600, whiteSpace: 'nowrap', minWidth: '120px' }}>Account Status</th>
+                  <th style={{ padding: '12px 16px', fontWeight: 600, whiteSpace: 'nowrap', minWidth: '140px' }}>Last Login</th>
+                  <th style={{ padding: '12px 16px', fontWeight: 600, whiteSpace: 'nowrap', minWidth: '120px', textAlign: 'right' }}>Actions</th>
                 </tr>
               </thead>
               <tbody>

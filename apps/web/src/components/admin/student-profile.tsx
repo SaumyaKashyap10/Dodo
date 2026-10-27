@@ -30,13 +30,23 @@ type Profile = {
   guardian_email?: string;
   guardian_phone?: string;
   enach_status?: string;
-  summary: { net_payable_minor: string; paid_minor: string; outstanding_minor: string };
+  summary: {
+    net_payable_minor: string;
+    paid_minor: string;
+    outstanding_minor: string;
+    excess_minor?: string;
+    is_overpaid?: boolean;
+    discounts_minor?: string;
+    total_assigned_fee_minor?: string;
+  };
   balances: Array<{
     schedule_id: string;
     account_reference: string;
     net_payable_minor: string;
     paid_minor: string;
     outstanding_minor: string;
+    excess_minor?: string;
+    is_overpaid?: boolean;
   }>;
 };
 
@@ -215,6 +225,26 @@ export function StudentProfile({ studentId }: { studentId: string }) {
   const [page, setPage] = useState(1);
   const [refresh, setRefresh] = useState(0);
   const [error, setError] = useState('');
+  const [reconciling, setReconciling] = useState(false);
+
+  const handleReconcile = async (action: 'refund' | 'credit_carry_forward' | 'fee_adjustment') => {
+    if (reconciling) return;
+    setReconciling(true);
+    setError('');
+    try {
+      const res = await request<{ ok: boolean; message: string }>(
+        `admin/fees/students/${studentId}/reconcile`,
+        'POST',
+        { action, notes: `Reconciled via ${action} by administrator` },
+      );
+      setNotice(res.message || `Excess payment successfully reconciled via ${action}.`);
+      setRefresh((n) => n + 1);
+    } catch (err: any) {
+      setError(err?.message || 'Failed to reconcile excess payment.');
+    } finally {
+      setReconciling(false);
+    }
+  };
 
   // Auto clear notice after 5 seconds
   useEffect(() => {
@@ -1053,6 +1083,15 @@ export function StudentProfile({ studentId }: { studentId: string }) {
     return Math.min(100, Math.round((paid / net) * 100));
   }, [profile]);
 
+  const { netMinor, paidMinor, excessMinor, isOverpaid } = useMemo(() => {
+    if (!profile) return { netMinor: 0, paidMinor: 0, excessMinor: 0, isOverpaid: false };
+    const net = Number(profile.summary.net_payable_minor || 0);
+    const paid = Number(profile.summary.paid_minor || 0);
+    const excess = Number(profile.summary.excess_minor || Math.max(0, paid - net));
+    const overpaid = excess > 0 || Boolean(profile.summary.is_overpaid);
+    return { netMinor: net, paidMinor: paid, excessMinor: excess, isOverpaid: overpaid };
+  }, [profile]);
+
   return (
     <>
       {editing && (
@@ -1532,11 +1571,102 @@ export function StudentProfile({ studentId }: { studentId: string }) {
               <strong className="stat-card-value" style={{ color: '#611a21', fontSize: '1.75rem', fontWeight: 800 }}>
                 {formatMoney(profile.summary.outstanding_minor)}
               </strong>
-              <div style={{ marginTop: 'auto', paddingTop: '4px', fontSize: '0.78rem', color: '#8a434a', display: 'flex', alignItems: 'center', gap: '4px' }}>
-                <span>⚠️</span> Pending recurring debit / installments
-              </div>
+              {isOverpaid ? (
+                <div style={{ marginTop: 'auto', paddingTop: '4px', fontSize: '0.78rem', color: '#b45309', display: 'flex', alignItems: 'center', gap: '4px', fontWeight: 600 }}>
+                  <span>⚠️</span> Excess Credit: {formatMoney(excessMinor)}
+                </div>
+              ) : (
+                <div style={{ marginTop: 'auto', paddingTop: '4px', fontSize: '0.78rem', color: '#8a434a', display: 'flex', alignItems: 'center', gap: '4px' }}>
+                  <span>⚠️</span> Pending recurring debit / installments
+                </div>
+              )}
             </div>
           </div>
+
+          {/* Overpayment Discrepancy Alert & Reconciliation Banner */}
+          {isOverpaid && (
+            <div
+              role="alert"
+              style={{
+                background: '#fffbeb',
+                border: '1px solid #fde68a',
+                borderRadius: '20px',
+                padding: '16px 22px',
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                flexWrap: 'wrap',
+                gap: '14px',
+                boxShadow: '0 4px 12px rgba(217, 119, 6, 0.08)',
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: '12px', maxWidth: '680px' }}>
+                <span style={{ fontSize: '1.6rem', lineHeight: 1 }}>⚠️</span>
+                <div>
+                  <strong style={{ color: '#92400e', fontSize: '0.98rem', display: 'block', marginBottom: '2px' }}>
+                    Overpayment Discrepancy Detected
+                  </strong>
+                  <span style={{ color: '#b45309', fontSize: '0.86rem', lineHeight: 1.4, display: 'block' }}>
+                    Verified payments ({formatMoney(paidMinor)}) exceed the Net Payable fee ({formatMoney(netMinor)}) by{' '}
+                    <strong>{formatMoney(excessMinor)}</strong>. Current outstanding fee is ₹0. Ordinary payments are blocked until this excess credit is reconciled.
+                  </span>
+                </div>
+              </div>
+              <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' }}>
+                <button
+                  type="button"
+                  onClick={() => handleReconcile('refund')}
+                  disabled={reconciling}
+                  style={{
+                    padding: '7px 14px',
+                    fontSize: '0.82rem',
+                    fontWeight: 600,
+                    borderRadius: '8px',
+                    border: '1px solid #d97706',
+                    background: '#ffffff',
+                    color: '#b45309',
+                    cursor: 'pointer',
+                  }}
+                >
+                  {reconciling ? 'Processing…' : 'Issue Refund'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleReconcile('credit_carry_forward')}
+                  disabled={reconciling}
+                  style={{
+                    padding: '7px 14px',
+                    fontSize: '0.82rem',
+                    fontWeight: 600,
+                    borderRadius: '8px',
+                    border: '1px solid #0d9488',
+                    background: '#ffffff',
+                    color: '#0f766e',
+                    cursor: 'pointer',
+                  }}
+                >
+                  {reconciling ? 'Processing…' : 'Carry Forward Credit'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleReconcile('fee_adjustment')}
+                  disabled={reconciling}
+                  style={{
+                    padding: '7px 14px',
+                    fontSize: '0.82rem',
+                    fontWeight: 600,
+                    borderRadius: '8px',
+                    border: '1px solid #4f46e5',
+                    background: '#ffffff',
+                    color: '#4338ca',
+                    cursor: 'pointer',
+                  }}
+                >
+                  {reconciling ? 'Processing…' : 'Apply Fee Adjustment'}
+                </button>
+              </div>
+            </div>
+          )}
 
           {/* 3. Workflow & Options Tabs Bar (Dashboard Overview Style) */}
           <div

@@ -298,55 +298,66 @@ export function PaymentsView() {
             <p className="small">Try adjusting your search criteria or filter options.</p>
           </div>
         ) : (
-          <div className="admin-table-wrap">
-            <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: 'var(--text-sm)' }}>
+          <div className="admin-table-wrap" style={{ overflowX: 'auto', WebkitOverflowScrolling: 'touch' }}>
+            <table
+              className="admin-table"
+              style={{
+                width: '100%',
+                minWidth: '1100px',
+                borderCollapse: 'collapse',
+                textAlign: 'left',
+                fontSize: 'var(--text-sm)',
+              }}
+            >
               <thead>
                 <tr style={{ background: '#f8fafc', borderBottom: '1px solid var(--surface-border)' }}>
-                  <th style={{ padding: '12px 16px', fontWeight: 600 }}>Payment ID</th>
-                  <th style={{ padding: '12px 16px', fontWeight: 600 }}>Student / Ref</th>
-                  <th style={{ padding: '12px 16px', fontWeight: 600 }}>Payer Name</th>
-                  <th style={{ padding: '12px 16px', fontWeight: 600 }}>Fee Category</th>
-                  <th style={{ padding: '12px 16px', fontWeight: 600 }}>Amount</th>
-                  <th style={{ padding: '12px 16px', fontWeight: 600 }}>Method</th>
-                  <th style={{ padding: '12px 16px', fontWeight: 600 }}>Reference</th>
-                  <th style={{ padding: '12px 16px', fontWeight: 600 }}>Date</th>
-                  <th style={{ padding: '12px 16px', fontWeight: 600 }}>Status</th>
-                  <th style={{ padding: '12px 16px', fontWeight: 600, textAlign: 'right' }}>Actions</th>
+                  <th style={{ padding: '12px 16px', fontWeight: 600, whiteSpace: 'nowrap', minWidth: '130px' }}>Payment ID</th>
+                  <th style={{ padding: '12px 16px', fontWeight: 600, whiteSpace: 'nowrap', minWidth: '170px' }}>Student / Ref</th>
+                  <th style={{ padding: '12px 16px', fontWeight: 600, whiteSpace: 'nowrap', minWidth: '140px' }}>Payer Name</th>
+                  <th style={{ padding: '12px 16px', fontWeight: 600, whiteSpace: 'nowrap', minWidth: '150px' }}>Fee Category</th>
+                  <th style={{ padding: '12px 16px', fontWeight: 600, whiteSpace: 'nowrap', minWidth: '120px', textAlign: 'right' }}>Amount</th>
+                  <th style={{ padding: '12px 16px', fontWeight: 600, whiteSpace: 'nowrap', minWidth: '130px' }}>Method</th>
+                  <th style={{ padding: '12px 16px', fontWeight: 600, whiteSpace: 'nowrap', minWidth: '160px' }}>Reference</th>
+                  <th style={{ padding: '12px 16px', fontWeight: 600, whiteSpace: 'nowrap', minWidth: '115px' }}>Date</th>
+                  <th style={{ padding: '12px 16px', fontWeight: 600, whiteSpace: 'nowrap', minWidth: '100px', textAlign: 'center' }}>Status</th>
+                  <th style={{ padding: '12px 16px', fontWeight: 600, whiteSpace: 'nowrap', minWidth: '150px', textAlign: 'right' }}>Actions</th>
                 </tr>
               </thead>
               <tbody>
                 {data.rows.map((row) => (
-                  <tr key={row.id} style={{ borderBottom: '1px solid var(--surface-border)' }}>
-                    <td style={{ padding: '12px 16px', fontWeight: 600, fontFamily: 'monospace', color: '#0f172a' }}>
+                  <tr key={row.id} style={{ borderBottom: '1px solid var(--surface-border)', verticalAlign: 'middle' }}>
+                    <td style={{ padding: '12px 16px', fontWeight: 600, fontFamily: 'monospace', color: '#0f172a', whiteSpace: 'nowrap' }}>
                       {row.id}
                     </td>
-                    <td style={{ padding: '12px 16px' }}>
-                      <div style={{ fontWeight: 600, color: 'var(--text-main)' }}>{row.student_name}</div>
-                      <div className="small" style={{ color: 'var(--text-muted)', fontFamily: 'monospace' }}>
+                    <td style={{ padding: '12px 16px', whiteSpace: 'nowrap' }}>
+                      <div style={{ fontWeight: 600, color: 'var(--text-main)', lineHeight: 1.3 }}>{row.student_name}</div>
+                      <div className="small" style={{ color: 'var(--text-muted)', fontFamily: 'monospace', fontSize: '11px', marginTop: '2px' }}>
                         {row.account_reference}
                       </div>
                     </td>
-                    <td style={{ padding: '12px 16px', color: 'var(--text-main)' }}>{row.payer_name}</td>
-                    <td style={{ padding: '12px 16px', color: 'var(--text-muted)' }}>{row.fee_category}</td>
-                    <td style={{ padding: '12px 16px', fontWeight: 700, color: 'var(--text-main)' }}>
+                    <td style={{ padding: '12px 16px', color: 'var(--text-main)', whiteSpace: 'nowrap' }}>{row.payer_name}</td>
+                    <td style={{ padding: '12px 16px', color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>{row.fee_category}</td>
+                    <td style={{ padding: '12px 16px', fontWeight: 700, color: 'var(--text-main)', whiteSpace: 'nowrap', textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>
                       {formatMoney(row.amount_minor)}
                     </td>
-                    <td style={{ padding: '12px 16px' }}>
+                    <td style={{ padding: '12px 16px', whiteSpace: 'nowrap' }}>
                       <span
                         style={{
                           display: 'inline-block',
-                          padding: '2px 8px',
+                          padding: '3px 8px',
                           borderRadius: 4,
-                          fontSize: '11px',
+                          fontSize: '11.5px',
                           fontWeight: 600,
                           background: '#f1f5f9',
                           color: '#334155',
+                          border: '1px solid #e2e8f0',
+                          whiteSpace: 'nowrap',
                         }}
                       >
                         {row.payment_mode}
                       </span>
                     </td>
-                    <td style={{ padding: '12px 16px', fontFamily: 'monospace', fontSize: '12px', color: 'var(--text-muted)' }}>
+                    <td style={{ padding: '12px 16px', fontFamily: 'monospace', fontSize: '12px', color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>
                       {row.provider_reference}
                     </td>
                     <td style={{ padding: '12px 16px', whiteSpace: 'nowrap', color: 'var(--text-muted)' }}>
@@ -356,15 +367,15 @@ export function PaymentsView() {
                         year: 'numeric',
                       })}
                     </td>
-                    <td style={{ padding: '12px 16px' }}>
+                    <td style={{ padding: '12px 16px', whiteSpace: 'nowrap', textAlign: 'center' }}>
                       <span className={financialStatusClass(row.status)}>{row.status}</span>
                     </td>
                     <td style={{ padding: '12px 16px', textAlign: 'right', whiteSpace: 'nowrap' }}>
-                      <div style={{ display: 'inline-flex', gap: '6px' }}>
+                      <div style={{ display: 'inline-flex', gap: '6px', justifyContent: 'flex-end' }}>
                         <button
                           type="button"
                           className="button secondary"
-                          style={{ padding: '4px 8px', fontSize: '12px' }}
+                          style={{ padding: '4px 10px', fontSize: '12px', fontWeight: 500 }}
                           onClick={() => setSelectedPayment(row)}
                           title="View Payment Breakdown"
                         >
@@ -373,7 +384,7 @@ export function PaymentsView() {
                         <button
                           type="button"
                           className="button secondary"
-                          style={{ padding: '4px 8px', fontSize: '12px' }}
+                          style={{ padding: '4px 10px', fontSize: '12px', fontWeight: 500 }}
                           onClick={() => setReceiptPayment(row)}
                           title="View Receipt"
                         >
@@ -383,7 +394,7 @@ export function PaymentsView() {
                           <button
                             type="button"
                             className="button secondary"
-                            style={{ padding: '4px 8px', fontSize: '12px', color: '#64748b' }}
+                            style={{ padding: '4px 10px', fontSize: '12px', color: '#64748b' }}
                             onClick={() => setRefundPayment(row)}
                             title="Refund Information"
                           >

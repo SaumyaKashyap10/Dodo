@@ -45,6 +45,9 @@ export function DirectPayment({
   const [instrumentNumber, setInstrumentNumber] = useState('');
   const [instrumentDate, setInstrumentDate] = useState(transactionDate);
   const [notes, setNotes] = useState('');
+  const [allowExcess, setAllowExcess] = useState(false);
+  const [authorizationReason, setAuthorizationReason] = useState('');
+  const [studentSummary, setStudentSummary] = useState<any>(null);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -65,10 +68,12 @@ export function DirectPayment({
       request<{ rows: FeeComponent[]; total: number }>(
         `admin/fees/students/${studentId}/records?section=components&pageSize=100`,
       ),
+      request<any>(`admin/fees/students/${studentId}`).catch(() => null),
     ])
-      .then(([instRes, compRes]) => {
+      .then(([instRes, compRes, profileRes]) => {
         if (!active) return;
         setInstallments(instRes.rows || []);
+        if (profileRes) setStudentSummary(profileRes);
         const comps = compRes.rows || [];
         setComponents(comps);
         if (comps.length > 0 && comps[0]) {
@@ -101,8 +106,19 @@ export function DirectPayment({
     .filter((i) => !['cancelled', 'adjusted'].includes(i.status))
     .reduce((sum, i) => sum + Number(i.remaining_minor || 0), 0);
 
+  const authoritativeOutstanding =
+    studentSummary?.summary?.outstanding_minor != null
+      ? Number(studentSummary.summary.outstanding_minor)
+      : totalOutstandingMinor;
+
+  const existingExcess = Number(studentSummary?.summary?.excess_minor || 0);
   const enteredAmountMinor = Math.round((Number(amountStr) || 0) * 100);
-  const remainingAfterPaymentMinor = Math.max(0, totalOutstandingMinor - enteredAmountMinor);
+  const isExcessPayment =
+    (authoritativeOutstanding > 0 && enteredAmountMinor > authoritativeOutstanding) ||
+    (authoritativeOutstanding === 0 && enteredAmountMinor > 0) ||
+    existingExcess > 0;
+  const excessAfterPaymentMinor = Math.max(0, enteredAmountMinor - authoritativeOutstanding);
+  const remainingAfterPaymentMinor = Math.max(0, authoritativeOutstanding - enteredAmountMinor);
 
   const bankRequired = ['neft', 'rtgs', 'imps', 'cheque', 'dd'].includes(mode);
   const instrumentRequired = ['cheque', 'dd'].includes(mode);
@@ -113,6 +129,14 @@ export function DirectPayment({
 
     if (!/^\d+(\.\d{1,2})?$/.test(amountStr) || enteredAmountMinor <= 0) {
       setError('Enter a valid positive payment amount.');
+      return;
+    }
+
+    if (isExcessPayment && !allowExcess) {
+      const overAmount = excessAfterPaymentMinor > 0 ? excessAfterPaymentMinor : enteredAmountMinor;
+      setError(
+        `Payment exceeds the outstanding balance by ₹${(overAmount / 100).toLocaleString('en-IN')}. Overpayments are blocked by default. Please select "Authorize Overpayment / Advance Payment" to proceed.`,
+      );
       return;
     }
 
@@ -136,6 +160,8 @@ export function DirectPayment({
           amountMinor: enteredAmountMinor,
           currency: 'INR',
           idempotencyKey,
+          allowExcess,
+          authorizationReason: authorizationReason.trim() || (allowExcess ? 'Manual overpayment authorized by institution admin' : undefined),
           providerReference: mode === 'cash' ? `CASH-${idempotencyKey.slice(0, 8)}` : (reference.trim() || `DIR-${idempotencyKey.slice(0, 8)}`),
           evidenceNote: notes.trim() || (selectedComponent ? `Direct payment for ${selectedComponent.label}` : 'Direct payment recorded by institution'),
           directPayment: {
@@ -155,6 +181,8 @@ export function DirectPayment({
           amountMinor: enteredAmountMinor,
           currency: 'INR',
           idempotencyKey,
+          allowExcess,
+          authorizationReason: authorizationReason.trim() || (allowExcess ? 'Manual overpayment authorized by institution admin' : undefined),
           providerReference: mode === 'cash' ? `CASH-${idempotencyKey.slice(0, 8)}` : (reference.trim() || `DIR-${idempotencyKey.slice(0, 8)}`),
           evidenceNote: notes.trim() || (selectedComponent ? `Direct payment for ${selectedComponent.label}` : 'Direct payment recorded by institution'),
           directPayment: {
@@ -346,9 +374,68 @@ export function DirectPayment({
                 }}
               />
               <span style={{ display: 'block', fontSize: '0.75rem', color: '#64748b', marginTop: '0.25rem' }}>
-                Payable Amount: {selectedComponent ? formatMoney(selectedComponent.amount_minor) : formatMoney(totalOutstandingMinor)}
+                Payable Amount: {selectedComponent ? formatMoney(selectedComponent.amount_minor) : formatMoney(authoritativeOutstanding)}
               </span>
             </div>
+
+            {/* Overpayment Warning & Authorization Workflow */}
+            {isExcessPayment && (
+              <div
+                role="alert"
+                style={{
+                  background: '#fffbeb',
+                  border: '1px solid #fde68a',
+                  borderRadius: '8px',
+                  padding: '0.75rem',
+                  fontSize: '0.85rem',
+                  color: '#92400e',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: '0.5rem',
+                }}
+              >
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                  <span>⚠️</span>
+                  <strong>Overpayment / Advance Warning</strong>
+                </div>
+                <p style={{ margin: 0, fontSize: '0.8rem', color: '#b45309' }}>
+                  {existingExcess > 0
+                    ? `Student account already has an unreconciled excess payment of ₹${(existingExcess / 100).toLocaleString('en-IN')}. Further ordinary payments are blocked until reconciled or authorized.`
+                    : `Entered amount (${formatMoney(enteredAmountMinor)}) exceeds the outstanding balance (${formatMoney(authoritativeOutstanding)}) by ${formatMoney(excessAfterPaymentMinor)}. Payments greater than the outstanding balance are not permitted by default.`}
+                </p>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer', fontWeight: 600, color: '#78350f', marginTop: '0.25rem' }}>
+                  <input
+                    type="checkbox"
+                    checked={allowExcess}
+                    onChange={(e) => setAllowExcess(e.target.checked)}
+                    disabled={busy}
+                  />
+                  Authorize Overpayment / Advance Payment
+                </label>
+                {allowExcess && (
+                  <div>
+                    <label style={{ display: 'block', fontSize: '0.75rem', fontWeight: 500, color: '#92400e', marginBottom: '0.2rem' }}>
+                      Authorization Reason / Justification
+                    </label>
+                    <input
+                      type="text"
+                      placeholder="e.g. Approved advance deposit or security payment"
+                      value={authorizationReason}
+                      onChange={(e) => setAuthorizationReason(e.target.value)}
+                      disabled={busy}
+                      style={{
+                        width: '100%',
+                        padding: '0.4rem 0.6rem',
+                        borderRadius: '4px',
+                        border: '1px solid #f59e0b',
+                        fontSize: '0.82rem',
+                        background: '#ffffff',
+                      }}
+                    />
+                  </div>
+                )}
+              </div>
+            )}
 
             {/* 3. Transaction Date */}
             <div>
@@ -514,11 +601,17 @@ export function DirectPayment({
             </div>
 
             {/* 7. Outstanding calculation footer */}
-            <div style={{ paddingTop: '0.5rem', borderTop: '1px solid #f1f5f9' }}>
+            <div style={{ paddingTop: '0.5rem', borderTop: '1px solid #f1f5f9', display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
               <p style={{ margin: 0, fontSize: '0.85rem', color: '#64748b' }}>
-                Your direct payment outstanding:{' '}
+                Remaining outstanding after payment:{' '}
                 <strong style={{ color: '#0f172a' }}>{formatMoney(remainingAfterPaymentMinor)}</strong>
               </p>
+              {excessAfterPaymentMinor > 0 && (
+                <p style={{ margin: 0, fontSize: '0.85rem', color: '#b45309', fontWeight: 600 }}>
+                  Excess credit balance generated:{' '}
+                  <strong>{formatMoney(excessAfterPaymentMinor)}</strong>
+                </p>
+              )}
             </div>
 
             {/* 8. Action Buttons */}

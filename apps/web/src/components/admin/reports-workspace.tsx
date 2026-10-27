@@ -295,8 +295,17 @@ export function ReportsWorkspace() {
                 <p className="small">Try selecting another date range or clearing search filters.</p>
               </div>
             ) : (
-              <div className="admin-table-wrap">
-                <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: 'var(--text-sm)' }}>
+              <div className="admin-table-wrap" style={{ overflowX: 'auto', WebkitOverflowScrolling: 'touch' }}>
+                <table
+                  className="admin-table"
+                  style={{
+                    width: '100%',
+                    minWidth: '950px',
+                    borderCollapse: 'collapse',
+                    textAlign: 'left',
+                    fontSize: 'var(--text-sm)',
+                  }}
+                >
                   <thead>
                     <tr style={{ background: '#f8fafc', borderBottom: '1px solid var(--surface-border)' }}>
                       {data?.columns.map((col, idx) => (

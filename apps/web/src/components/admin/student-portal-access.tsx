@@ -25,7 +25,7 @@ export function StudentPortalAccess({
             Create a secure, 24-hour access code for this student’s linked payer.
           </p>
         </div>
-        <Link href="/student/" target="_blank" rel="noopener noreferrer">
+        <Link href="/portal/" target="_blank" rel="noopener noreferrer">
           Open student login ↗
         </Link>
       </div>
@@ -98,8 +98,8 @@ export function StudentPortalAccess({
             >
               Copy access code
             </button>
-            <Link href={'/student/?token=' + encodeURIComponent(code)} target="_blank" rel="noopener noreferrer">
-              Open secure student portal ↗
+            <Link href={grant.path} target="_blank" rel="noopener noreferrer">
+              Open secure payer page ↗
             </Link>
           </div>
           <p className="small">

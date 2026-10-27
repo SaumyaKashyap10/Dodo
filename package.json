@@ -1,8 +1,8 @@
 {
-  "name": "dodo-unified",
+  "name": "website-jodo",
   "version": "0.1.0",
   "private": true,
-  "description": "Dodo Unified Platform - Institution Admin Dashboard, Platform Owner CMS, and Standalone Student Dashboard",
+  "description": "Jodo reference recreation and blueprint-driven owner CMS",
   "engines": {
     "node": ">=22.16.0 <23 || >=24 <25"
   },
@@ -32,11 +32,7 @@
     "backup": "node --env-file=.env scripts/backup.mjs",
     "restore:verify": "node --env-file=.env scripts/restore-verify.mjs",
     "preview": "node scripts/preview.mjs",
-    "prestart:prod": "node scripts/production-gate.mjs",
-    "dev:admin": "concurrently -k -n web,api \"npm:dev:web\" \"npm:dev:api\"",
-    "setup:native": "node scripts/native-local.mjs --setup",
-    "dev:native": "node scripts/native-local.mjs",
-    "owner:code": "node scripts/owner-code.mjs"
+    "prestart:prod": "node scripts/production-gate.mjs"
   },
   "dependencies": {
     "@nestjs/common": "12.1.2",
